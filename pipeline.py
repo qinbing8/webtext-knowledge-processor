@@ -158,19 +158,32 @@ def load_config(config_path: Path) -> PipelineConfig:
     extract_batch_raw = batching_raw.get("extract", {}) or {}
     synthesize_batch_raw = batching_raw.get("synthesize", {}) or {}
 
+    provider_limits = ProviderLimits(
+        gemini=int(provider_limits_raw.get("gemini", 100)),
+        claude=int(provider_limits_raw.get("claude", 200)),
+        openai=int(provider_limits_raw.get("openai", 150)),
+    )
+    for _name in ("gemini", "claude", "openai"):
+        if getattr(provider_limits, _name) <= 0:
+            raise PipelineError(f"配置项 batching.provider_limits.{_name} 必须为正数")
+
+    extract_max_batch_kb = int(extract_batch_raw.get("max_batch_size_kb", 200))
+    if extract_max_batch_kb <= 0:
+        raise PipelineError("配置项 batching.extract.max_batch_size_kb 必须为正数")
+
+    synthesize_max_batch_kb = int(synthesize_batch_raw.get("max_batch_size_kb", 200))
+    if synthesize_max_batch_kb <= 0:
+        raise PipelineError("配置项 batching.synthesize.max_batch_size_kb 必须为正数")
+
     batching = BatchingConfig(
-        provider_limits=ProviderLimits(
-            gemini=int(provider_limits_raw.get("gemini", 100)),
-            claude=int(provider_limits_raw.get("claude", 200)),
-            openai=int(provider_limits_raw.get("openai", 150)),
-        ),
+        provider_limits=provider_limits,
         extract=ExtractBatchingConfig(
             enabled=bool(extract_batch_raw.get("enabled", True)),
             max_files_per_batch=int(extract_batch_raw.get("max_files_per_batch", 5)),
-            max_batch_size_kb=int(extract_batch_raw.get("max_batch_size_kb", 200)),
+            max_batch_size_kb=extract_max_batch_kb,
         ),
         synthesize=SynthesizeBatchingConfig(
-            max_batch_size_kb=int(synthesize_batch_raw.get("max_batch_size_kb", 200)),
+            max_batch_size_kb=synthesize_max_batch_kb,
         ),
     )
 
@@ -364,15 +377,24 @@ def measure_payload_size_kb(obj: Any) -> float:
     return len(json.dumps(obj, ensure_ascii=False).encode("utf-8")) / 1024.0
 
 
-def get_effective_size_limit(soft_limit_kb: float, provider: str, provider_limits: ProviderLimits) -> float:
-    """返回 min(软限制, provider 硬限制)。"""
+def get_effective_size_limit(
+    soft_limit_kb: float,
+    provider: str,
+    provider_limits: ProviderLimits,
+    safety_margin: float = 0.85,
+) -> float:
+    """返回 min(软限制, provider 硬限制) * safety_margin。
+
+    safety_margin 用于预留 prompt 包装、JSON 结构等请求开销，
+    避免实际 payload 接近 provider 硬上限时触发 413/429。
+    """
     hard_limits = {
         "gemini": provider_limits.gemini,
         "claude": provider_limits.claude,
         "openai": provider_limits.openai,
     }
     hard_limit = hard_limits.get(provider.lower(), 200)
-    return min(soft_limit_kb, hard_limit)
+    return min(soft_limit_kb, hard_limit) * safety_margin
 
 
 def compute_batches(
@@ -1385,9 +1407,9 @@ def run_extract_stage(
     # 将文件分为：小文件（可合批）、大文件（单独调用）、超大文件（拆块）
     tasks: List[Dict[str, Any]] = []  # 每项: type=single|batch_item|chunk, ...
     for fd in file_data:
-        if fd["size_kb"] >= 200:
+        if fd["size_kb"] >= effective_limit:
             # 超大文件 → 按段落边界拆块
-            chunks = split_large_text(fd["text"], 200)
+            chunks = split_large_text(fd["text"], effective_limit)
             print(f"[extract] {fd['source_name']} ({fd['size_kb']:.1f}KB) → 拆分为 {len(chunks)} 块")
             for ci, chunk in enumerate(chunks, 1):
                 tasks.append({
