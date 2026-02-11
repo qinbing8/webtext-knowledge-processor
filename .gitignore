@@ -1,0 +1,33 @@
+.ace-tool/
+.venv/
+__pycache__/
+_intermediate/
+_logs/
+*.log
+*.pyc
+nul
+
+# 真实配置含 API 密钥，仅跟踪 .example 模板
+config.yaml
+config.smoke.yaml
+config.run.yaml
+版本/*/config.yaml
+版本/*/config.smoke.yaml
+版本/*/config.run.yaml
+
+# 直播文本/素材文件（非代码）
+*.txt
+*.docx
+
+# 程序执行生成的输出目录
+_smoke_input/
+_smoke_output/
+
+# Claude 配置（本地）
+.claude/
+
+# 其他非代码文件
+网文新人指南/
+系统提示词_模板.md
+网文提示词增强.md
+需求文档.md
