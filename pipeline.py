@@ -1385,9 +1385,9 @@ def run_extract_stage(
     # 将文件分为：小文件（可合批）、大文件（单独调用）、超大文件（拆块）
     tasks: List[Dict[str, Any]] = []  # 每项: type=single|batch_item|chunk, ...
     for fd in file_data:
-        if fd["size_kb"] >= 200:
+        if fd["size_kb"] >= effective_limit:
             # 超大文件 → 按段落边界拆块
-            chunks = split_large_text(fd["text"], 200)
+            chunks = split_large_text(fd["text"], effective_limit)
             print(f"[extract] {fd['source_name']} ({fd['size_kb']:.1f}KB) → 拆分为 {len(chunks)} 块")
             for ci, chunk in enumerate(chunks, 1):
                 tasks.append({
