@@ -39,6 +39,7 @@ class Endpoint:
     name: str
     api_url: str
     api_key: str
+    api_type: str = ""  # 可选覆盖，为空则 fallback 到 StageConfig.api_type
 
 
 @dataclass(frozen=True)
@@ -114,7 +115,7 @@ class RuntimeConfig:
 @dataclass(frozen=True)
 class ProviderLimits:
     gemini: int = 100    # KB
-    claude: int = 200    # KB
+    claude: int = 353    # KB
     openai: int = 150    # KB
 
 
@@ -122,12 +123,12 @@ class ProviderLimits:
 class ExtractBatchingConfig:
     enabled: bool = True
     max_files_per_batch: int = 5
-    max_batch_size_kb: int = 200
+    max_batch_size_kb: int = 353
 
 
 @dataclass(frozen=True)
 class SynthesizeBatchingConfig:
-    max_batch_size_kb: int = 200
+    max_batch_size_kb: int = 353
 
 
 @dataclass(frozen=True)
@@ -343,7 +344,13 @@ def build_stage_config(stage_name: str, raw_stage: Any) -> StageConfig:
                 raise PipelineError(
                     f"阶段配置错误：stages.{stage_name}.endpoints[{i}].api_url 必须是 http/https 地址"
                 )
-            endpoints.append(Endpoint(name=ep_name, api_url=ep_url, api_key=ep_key))
+            ep_api_type = str(ep_raw.get("api_type", "")).strip().lower()
+            if ep_api_type and ep_api_type not in {"openai", "anthropic", "gemini"}:
+                raise PipelineError(
+                    f"阶段配置错误：stages.{stage_name}.endpoints[{i}].api_type "
+                    f"仅支持 openai / anthropic / gemini"
+                )
+            endpoints.append(Endpoint(name=ep_name, api_url=ep_url, api_key=ep_key, api_type=ep_api_type))
 
     return StageConfig(
         provider=normalized_provider,
@@ -1142,7 +1149,7 @@ def call_llm(
         merged_user = user_prompt
     brief_system = "请严格按照 <instructions> 中的指令执行任务。"
 
-    api_type = stage.api_type
+    api_type = endpoint.api_type or stage.api_type
     if api_type == "openai":
         return call_openai(
             endpoint.api_key,
@@ -1212,7 +1219,8 @@ def call_llm_with_failover(
 
     failures: List[str] = []
     for i, es in enumerate(available):
-        print(f"[failover] 尝试端点 '{es.name}'...")
+        effective_type = es.endpoint.api_type or stage.api_type
+        print(f"[failover] 尝试端点 '{es.name}' (api_type={effective_type})...")
         try:
             result = call_llm(stage, es.endpoint, system_prompt, user_prompt, runtime)
             es.record_success()
@@ -1472,6 +1480,42 @@ def _append_manifest(manifest_path: Path, names: List[str]) -> None:
             f.write(name + "\n")
 
 
+_TASK_MAX_RETRIES = 3          # L3 层每个任务的最大重试次数
+_TASK_RETRY_INTERVAL = 15      # 普通失败后等待秒数
+_CIRCUIT_WAIT_SECONDS = 70     # 熔断后等待秒数（> CIRCUIT_COOLDOWN_SECONDS=60）
+
+
+def _extract_with_retry(
+    call_fn: Callable[[], str],
+    label: str,
+    max_retries: int = _TASK_MAX_RETRIES,
+) -> str:
+    """L3 层重试包装：处理 PipelineError 和 EndpointsExhaustedError。"""
+    for attempt in range(1, max_retries + 2):  # +1 for initial attempt
+        try:
+            return call_fn()
+        except EndpointsExhaustedError:
+            if attempt > max_retries:
+                raise
+            print(
+                f"[extract] {label}: 所有端点已熔断，"
+                f"等待 {_CIRCUIT_WAIT_SECONDS}s 后重试 "
+                f"({attempt}/{max_retries})..."
+            )
+            time.sleep(_CIRCUIT_WAIT_SECONDS)
+        except PipelineError as exc:
+            if attempt > max_retries:
+                raise
+            print(
+                f"[extract] {label}: 失败 ({exc})，"
+                f"{_TASK_RETRY_INTERVAL}s 后重试 "
+                f"({attempt}/{max_retries})..."
+            )
+            time.sleep(_TASK_RETRY_INTERVAL)
+    # unreachable, but for safety
+    raise PipelineError(f"{label}: 重试 {max_retries} 次后仍失败")
+
+
 def run_extract_stage(
     config: PipelineConfig,
 ) -> Path:
@@ -1589,13 +1633,16 @@ def run_extract_stage(
                 t = normal_map[name]
                 print(f"[extract {processed}/{total_calls}] {name} (编码: {t['detected_encoding']})")
                 try:
-                    md = _extract_single(config, endpoint_states, name, t["text"])
+                    md = _extract_with_retry(
+                        lambda _n=name, _t=t["text"]: _extract_single(config, endpoint_states, _n, _t),
+                        label=name,
+                    )
                     out_path = extract_dir / f"{safe_filename(name)}.md"
                     out_path.write_text(md, encoding="utf-8")
                     _append_manifest(manifest_path, [name])
                     print(f"[extract] → {out_path.name}")
-                except PipelineError as exc:
-                    print(f"[extract] 失败: {name}: {exc}")
+                except (PipelineError, EndpointsExhaustedError) as exc:
+                    print(f"[extract] 失败（重试耗尽）: {name}: {exc}")
             else:
                 # 多文件批次
                 batch_size_kb = sum(normal_map[n]["size_kb"] for n in batch_names)
@@ -1605,24 +1652,30 @@ def run_extract_stage(
                 )
                 files_for_prompt = [(n, normal_map[n]["text"]) for n in batch_names]
                 try:
-                    md = _extract_batch(config, endpoint_states, files_for_prompt)
+                    md = _extract_with_retry(
+                        lambda _f=files_for_prompt: _extract_batch(config, endpoint_states, _f),
+                        label=f"批次 {batch_idx}",
+                    )
                     out_path = extract_dir / f"batch_{batch_idx:03d}.md"
                     out_path.write_text(md, encoding="utf-8")
                     _append_manifest(manifest_path, batch_names)
                     print(f"[extract] → {out_path.name}")
-                except PipelineError as exc:
-                    # 批量失败 → 逐文件回退
-                    print(f"[extract] 批次失败: {exc}，逐文件回退")
+                except (PipelineError, EndpointsExhaustedError) as exc:
+                    # 批量失败（重试耗尽） → 逐文件回退
+                    print(f"[extract] 批次失败（重试耗尽）: {exc}，逐文件回退")
                     for fi, name in enumerate(batch_names, 1):
                         t = normal_map[name]
                         print(f"[extract] 回退处理: {name} ({fi}/{len(batch_names)})")
                         try:
-                            md = _extract_single(config, endpoint_states, name, t["text"])
+                            md = _extract_with_retry(
+                                lambda _n=name, _t=t["text"]: _extract_single(config, endpoint_states, _n, _t),
+                                label=name,
+                            )
                             out_path = extract_dir / f"{safe_filename(name)}.md"
                             out_path.write_text(md, encoding="utf-8")
                             _append_manifest(manifest_path, [name])
-                        except PipelineError as single_exc:
-                            print(f"[extract] 单文件也失败: {name}: {single_exc}")
+                        except (PipelineError, EndpointsExhaustedError) as single_exc:
+                            print(f"[extract] 单文件也失败（重试耗尽）: {name}: {single_exc}")
     else:
         # 不启用批处理 → 逐文件处理
         total_calls += len(normal_tasks)
@@ -1631,12 +1684,15 @@ def run_extract_stage(
             name = t["source_name"]
             print(f"[extract {processed}/{total_calls}] {name} (编码: {t['detected_encoding']})")
             try:
-                md = _extract_single(config, endpoint_states, name, t["text"])
+                md = _extract_with_retry(
+                    lambda _n=name, _t=t["text"]: _extract_single(config, endpoint_states, _n, _t),
+                    label=name,
+                )
                 out_path = extract_dir / f"{safe_filename(name)}.md"
                 out_path.write_text(md, encoding="utf-8")
                 _append_manifest(manifest_path, [name])
-            except PipelineError as exc:
-                print(f"[extract] 失败: {name}: {exc}")
+            except (PipelineError, EndpointsExhaustedError) as exc:
+                print(f"[extract] 失败（重试耗尽）: {name}: {exc}")
 
     # 处理超大文件拆块
     for t in chunk_tasks:
@@ -1646,14 +1702,18 @@ def run_extract_stage(
         ct = t["chunk_total"]
         print(f"[extract {processed}/{total_calls}] {name} 块 {ci}/{ct}")
         try:
-            md = _extract_single(config, endpoint_states, f"{name} (块 {ci}/{ct})", t["text"])
+            chunk_label = f"{name} (块 {ci}/{ct})"
+            md = _extract_with_retry(
+                lambda _l=chunk_label, _t=t["text"]: _extract_single(config, endpoint_states, _l, _t),
+                label=chunk_label,
+            )
             out_path = extract_dir / f"{safe_filename(name)}_part{ci}.md"
             out_path.write_text(md, encoding="utf-8")
             # 只在最后一块处理完后才添加到 manifest
             if ci == ct:
                 _append_manifest(manifest_path, [name])
-        except PipelineError as exc:
-            print(f"[extract] 失败: {name} 块 {ci}: {exc}")
+        except (PipelineError, EndpointsExhaustedError) as exc:
+            print(f"[extract] 失败（重试耗尽）: {name} 块 {ci}: {exc}")
 
     print(f"[extract] 阶段完成，输出目录：{extract_dir}")
     return extract_dir
@@ -2091,7 +2151,11 @@ def _apply_tag_grouping(
 def _fmt_endpoints(stage: StageConfig) -> str:
     """格式化端点信息用于日志输出。"""
     if stage.endpoints:
-        parts = [f"{ep.name}({ep.api_url})" for ep in stage.endpoints]
+        parts = [
+            f"{ep.name}({ep.api_url})"
+            + (f"[{ep.api_type}]" if ep.api_type else "")
+            for ep in stage.endpoints
+        ]
         return " → ".join(parts)
     return stage.api_url or "default"
 
