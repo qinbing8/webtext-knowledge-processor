@@ -5,6 +5,7 @@ import datetime as dt
 import hashlib
 import http.client
 import json
+import ssl
 import os
 import re
 import sys
@@ -28,6 +29,18 @@ class PipelineError(RuntimeError):
     """管道执行异常。"""
 
 
+class EndpointsExhaustedError(RuntimeError):
+    """所有端点均已熔断，需要用户检查中转站配置。"""
+
+
+@dataclass(frozen=True)
+class Endpoint:
+    """单个 API 端点（中转站）配置。"""
+    name: str
+    api_url: str
+    api_key: str
+
+
 @dataclass(frozen=True)
 class StageConfig:
     provider: str
@@ -36,15 +49,59 @@ class StageConfig:
     api_type: str
     api_url: str | None = None
     api_key: str | None = None
+    endpoints: tuple = ()  # Tuple[Endpoint, ...] 多端点故障转移列表
 
     def __repr__(self) -> str:
-        masked_key = "***" if self.api_key else None
+        if self.endpoints:
+            ep_info = f"endpoints={len(self.endpoints)}"
+        else:
+            masked_key = "***" if self.api_key else None
+            ep_info = f"api_url={self.api_url!r}, api_key={masked_key!r}"
         return (
             f"StageConfig(provider={self.provider!r}, model={self.model!r}, "
             f"system_prompt=<{len(self.system_prompt)} chars>, "
-            f"api_type={self.api_type!r}, api_url={self.api_url!r}, "
-            f"api_key={masked_key!r})"
+            f"api_type={self.api_type!r}, {ep_info})"
         )
+
+
+# ── 熔断参数 ──
+CIRCUIT_FAILURE_THRESHOLD = 3    # 连续失败 N 次触发熔断
+CIRCUIT_COOLDOWN_SECONDS = 60    # 熔断冷却期（秒）
+
+
+class EndpointState:
+    """端点运行时状态（熔断管理）。
+
+    在一次 pipeline 运行中，每个端点有一个 EndpointState 实例，
+    跟踪连续失败次数并在达到阈值时触发熔断。
+    """
+
+    def __init__(self, endpoint: Endpoint) -> None:
+        self.endpoint = endpoint
+        self.consecutive_failures = 0
+        self.circuit_open_until = 0.0
+
+    @property
+    def name(self) -> str:
+        return self.endpoint.name
+
+    def is_available(self) -> bool:
+        if self.consecutive_failures < CIRCUIT_FAILURE_THRESHOLD:
+            return True
+        return time.time() >= self.circuit_open_until
+
+    def record_success(self) -> None:
+        self.consecutive_failures = 0
+        self.circuit_open_until = 0.0
+
+    def record_failure(self) -> None:
+        self.consecutive_failures += 1
+        if self.consecutive_failures >= CIRCUIT_FAILURE_THRESHOLD:
+            self.circuit_open_until = time.time() + CIRCUIT_COOLDOWN_SECONDS
+            print(
+                f"[failover] 端点 '{self.name}' 连续失败 "
+                f"{self.consecutive_failures} 次，熔断 {CIRCUIT_COOLDOWN_SECONDS} 秒"
+            )
 
 
 @dataclass(frozen=True)
@@ -262,6 +319,32 @@ def build_stage_config(stage_name: str, raw_stage: Any) -> StageConfig:
     if normalized_api_key is not None and not normalized_api_key:
         normalized_api_key = None
 
+    # ── 解析 endpoints 列表（新格式） ──
+    endpoints_raw = raw_stage.get("endpoints")
+    endpoints: List[Endpoint] = []
+    if isinstance(endpoints_raw, list) and endpoints_raw:
+        for i, ep_raw in enumerate(endpoints_raw):
+            if not isinstance(ep_raw, dict):
+                raise PipelineError(
+                    f"阶段配置错误：stages.{stage_name}.endpoints[{i}] 必须是映射"
+                )
+            ep_name = str(ep_raw.get("name", f"endpoint_{i + 1}"))
+            ep_url = str(ep_raw.get("api_url", "")).strip()
+            ep_key = str(ep_raw.get("api_key", "")).strip()
+            if not ep_url:
+                raise PipelineError(
+                    f"阶段配置错误：stages.{stage_name}.endpoints[{i}].api_url 不能为空"
+                )
+            if not ep_key:
+                raise PipelineError(
+                    f"阶段配置错误：stages.{stage_name}.endpoints[{i}].api_key 不能为空"
+                )
+            if not re.match(r"^https?://", ep_url):
+                raise PipelineError(
+                    f"阶段配置错误：stages.{stage_name}.endpoints[{i}].api_url 必须是 http/https 地址"
+                )
+            endpoints.append(Endpoint(name=ep_name, api_url=ep_url, api_key=ep_key))
+
     return StageConfig(
         provider=normalized_provider,
         model=model.strip(),
@@ -269,6 +352,7 @@ def build_stage_config(stage_name: str, raw_stage: Any) -> StageConfig:
         api_type=normalized_api_type,
         api_url=normalized_api_url,
         api_key=normalized_api_key,
+        endpoints=tuple(endpoints),
     )
 
 
@@ -551,9 +635,9 @@ def post_json(
     safe_url = sanitize_url_for_log(url)
     body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
 
-    # 网络中断重连：1 分钟内最多重试 5 次，每次间隔 12 秒
-    NETWORK_MAX_RETRIES = 5
-    NETWORK_RETRY_INTERVAL = 12  # 秒 (5 × 12 = 60s ≈ 1 分钟)
+    # 网络中断重连：最多重试 3 次，每次间隔 8 秒
+    NETWORK_MAX_RETRIES = 3
+    NETWORK_RETRY_INTERVAL = 8  # 秒
     NETWORK_ERRORS = (
         http.client.RemoteDisconnected,
         http.client.IncompleteRead,
@@ -820,9 +904,10 @@ _NETWORK_ERRORS = (
     ConnectionResetError,
     ConnectionAbortedError,
     BrokenPipeError,
+    ssl.SSLEOFError,
 )
-_NETWORK_MAX_RETRIES = 5
-_NETWORK_RETRY_INTERVAL = 12
+_NETWORK_MAX_RETRIES = 3
+_NETWORK_RETRY_INTERVAL = 8
 _CONTENT_MAX_RETRIES = 3
 _CONTENT_RETRY_INTERVAL = 10
 
@@ -1043,7 +1128,7 @@ def call_gemini(
 
 def call_llm(
     stage: StageConfig,
-    api_key: str,
+    endpoint: Endpoint,
     system_prompt: str,
     user_prompt: str,
     runtime: RuntimeConfig,
@@ -1060,49 +1145,86 @@ def call_llm(
     api_type = stage.api_type
     if api_type == "openai":
         return call_openai(
-            api_key,
+            endpoint.api_key,
             stage.model,
             brief_system,
             merged_user,
             runtime,
-            stage.api_url,
+            endpoint.api_url,
         )
     if api_type == "anthropic":
         return call_claude(
-            api_key,
+            endpoint.api_key,
             stage.model,
             brief_system,
             merged_user,
             runtime,
-            stage.api_url,
+            endpoint.api_url,
         )
     if api_type == "gemini":
         return call_gemini(
-            api_key,
+            endpoint.api_key,
             stage.model,
             brief_system,
             merged_user,
             runtime,
-            stage.api_url,
+            endpoint.api_url,
         )
     raise PipelineError(f"不支持的 api_type：{api_type}")
 
 
-def call_llm_with_key_rotation(
+def _create_endpoint_states(
+    config: PipelineConfig, stage: StageConfig,
+) -> List[EndpointState]:
+    """从 StageConfig 创建端点状态列表。支持新旧两种配置格式。"""
+    if stage.endpoints:
+        return [EndpointState(ep) for ep in stage.endpoints]
+    # 旧格式兼容：api_url + api_key(s)
+    api_keys = get_api_keys(config, stage.provider, stage.api_key)
+    return [
+        EndpointState(Endpoint(
+            name=f"key_{i + 1}" if len(api_keys) > 1 else "default",
+            api_url=stage.api_url or "",
+            api_key=k,
+        ))
+        for i, k in enumerate(api_keys)
+    ]
+
+
+def call_llm_with_failover(
     stage: StageConfig,
-    api_keys: List[str],
+    endpoint_states: List[EndpointState],
     system_prompt: str,
     user_prompt: str,
     runtime: RuntimeConfig,
 ) -> str:
-    failures: List[str] = []
-    for index, api_key in enumerate(api_keys, start=1):
-        try:
-            return call_llm(stage, api_key, system_prompt, user_prompt, runtime)
-        except PipelineError as exc:
-            failures.append(f"key[{index}/{len(api_keys)}]: {exc}")
+    """多端点故障转移调用，带熔断机制。"""
+    available = [es for es in endpoint_states if es.is_available()]
+    if not available:
+        details = "\n".join(
+            f"  - {es.name}: 连续失败 {es.consecutive_failures} 次"
+            for es in endpoint_states
+        )
+        raise EndpointsExhaustedError(
+            f"所有端点均已熔断（连续失败 ≥{CIRCUIT_FAILURE_THRESHOLD} 次），"
+            f"请检查中转站配置后重试。\n{details}"
+        )
 
-    raise PipelineError("所有 API Key 均调用失败：" + " | ".join(failures))
+    failures: List[str] = []
+    for i, es in enumerate(available):
+        print(f"[failover] 尝试端点 '{es.name}'...")
+        try:
+            result = call_llm(stage, es.endpoint, system_prompt, user_prompt, runtime)
+            es.record_success()
+            return result
+        except PipelineError as exc:
+            es.record_failure()
+            failures.append(f"{es.name}: {exc}")
+            next_i = i + 1
+            if next_i < len(available):
+                print(f"[failover] 端点 '{es.name}' 失败，切换到 '{available[next_i].name}'")
+
+    raise PipelineError("所有端点均调用失败：" + " | ".join(failures))
 
 
 # ── 错误分类 ──
@@ -1294,15 +1416,15 @@ def split_large_text(text: str, max_size_kb: float) -> List[str]:
 
 def _extract_single(
     config: PipelineConfig,
-    api_keys: List[str],
+    endpoint_states: List[EndpointState],
     source_name: str,
     text: str,
 ) -> str:
     """单次 LLM 调用，返回 Markdown 文本。"""
     user_prompt = f"请处理以下文件。文件名：{source_name}\n\n{text}"
-    raw = call_llm_with_key_rotation(
+    raw = call_llm_with_failover(
         stage=config.extract_stage,
-        api_keys=api_keys,
+        endpoint_states=endpoint_states,
         system_prompt=config.extract_stage.system_prompt,
         user_prompt=user_prompt,
         runtime=config.runtime,
@@ -1312,7 +1434,7 @@ def _extract_single(
 
 def _extract_batch(
     config: PipelineConfig,
-    api_keys: List[str],
+    endpoint_states: List[EndpointState],
     files: List[Tuple[str, str]],
 ) -> str:
     """多文件合批调用。prompt 中用分隔线列出各文件，输出为一整块 Markdown。"""
@@ -1320,9 +1442,9 @@ def _extract_batch(
     for name, text in files:
         parts.append(f"---\n## 来源文件：{name}\n\n{text}")
     user_prompt = "请逐个处理以下文件。\n\n" + "\n\n".join(parts)
-    raw = call_llm_with_key_rotation(
+    raw = call_llm_with_failover(
         stage=config.extract_stage,
-        api_keys=api_keys,
+        endpoint_states=endpoint_states,
         system_prompt=config.extract_stage.system_prompt,
         user_prompt=user_prompt,
         runtime=config.runtime,
@@ -1362,7 +1484,7 @@ def run_extract_stage(
     extract_dir.mkdir(parents=True, exist_ok=True)
     manifest_path = extract_dir / "_manifest.txt"
 
-    api_keys = get_api_keys(config, config.extract_stage.provider, config.extract_stage.api_key)
+    endpoint_states = _create_endpoint_states(config, config.extract_stage)
     batch_cfg = config.batching.extract
 
     print(f"[extract] 共发现 {len(source_files)} 个 .txt 文件")
@@ -1467,7 +1589,7 @@ def run_extract_stage(
                 t = normal_map[name]
                 print(f"[extract {processed}/{total_calls}] {name} (编码: {t['detected_encoding']})")
                 try:
-                    md = _extract_single(config, api_keys, name, t["text"])
+                    md = _extract_single(config, endpoint_states, name, t["text"])
                     out_path = extract_dir / f"{safe_filename(name)}.md"
                     out_path.write_text(md, encoding="utf-8")
                     _append_manifest(manifest_path, [name])
@@ -1483,7 +1605,7 @@ def run_extract_stage(
                 )
                 files_for_prompt = [(n, normal_map[n]["text"]) for n in batch_names]
                 try:
-                    md = _extract_batch(config, api_keys, files_for_prompt)
+                    md = _extract_batch(config, endpoint_states, files_for_prompt)
                     out_path = extract_dir / f"batch_{batch_idx:03d}.md"
                     out_path.write_text(md, encoding="utf-8")
                     _append_manifest(manifest_path, batch_names)
@@ -1491,10 +1613,11 @@ def run_extract_stage(
                 except PipelineError as exc:
                     # 批量失败 → 逐文件回退
                     print(f"[extract] 批次失败: {exc}，逐文件回退")
-                    for name in batch_names:
+                    for fi, name in enumerate(batch_names, 1):
                         t = normal_map[name]
+                        print(f"[extract] 回退处理: {name} ({fi}/{len(batch_names)})")
                         try:
-                            md = _extract_single(config, api_keys, name, t["text"])
+                            md = _extract_single(config, endpoint_states, name, t["text"])
                             out_path = extract_dir / f"{safe_filename(name)}.md"
                             out_path.write_text(md, encoding="utf-8")
                             _append_manifest(manifest_path, [name])
@@ -1508,7 +1631,7 @@ def run_extract_stage(
             name = t["source_name"]
             print(f"[extract {processed}/{total_calls}] {name} (编码: {t['detected_encoding']})")
             try:
-                md = _extract_single(config, api_keys, name, t["text"])
+                md = _extract_single(config, endpoint_states, name, t["text"])
                 out_path = extract_dir / f"{safe_filename(name)}.md"
                 out_path.write_text(md, encoding="utf-8")
                 _append_manifest(manifest_path, [name])
@@ -1523,7 +1646,7 @@ def run_extract_stage(
         ct = t["chunk_total"]
         print(f"[extract {processed}/{total_calls}] {name} 块 {ci}/{ct}")
         try:
-            md = _extract_single(config, api_keys, f"{name} (块 {ci}/{ct})", t["text"])
+            md = _extract_single(config, endpoint_states, f"{name} (块 {ci}/{ct})", t["text"])
             out_path = extract_dir / f"{safe_filename(name)}_part{ci}.md"
             out_path.write_text(md, encoding="utf-8")
             # 只在最后一块处理完后才添加到 manifest
@@ -1686,7 +1809,7 @@ def run_synthesize_stage(
 ) -> None:
     """Synthesize 阶段：按分类标签归组 → 标签合并 → 逐分类 LLM 合并去重。"""
 
-    api_keys = get_api_keys(config, config.synthesize_stage.provider, config.synthesize_stage.api_key)
+    endpoint_states = _create_endpoint_states(config, config.synthesize_stage)
     intermediate_dir = config.output_dir / "_intermediate"
     intermediate_dir.mkdir(parents=True, exist_ok=True)
     topics_dir = config.output_dir / "topics"
@@ -1729,7 +1852,7 @@ def run_synthesize_stage(
     print("[synthesize] Phase 1.5: 标签合并...")
     mapping = _resolve_tag_mapping(
         list(buckets.keys()), config.merge,
-        config.synthesize_stage, api_keys, config.runtime,
+        config.synthesize_stage, endpoint_states, config.runtime,
     )
     merged_buckets = _apply_tag_grouping(buckets, mapping)
     mapping_mode = "manual" if config.merge.mapping else ("llm" if config.merge.use_llm else "identity")
@@ -1779,9 +1902,9 @@ def run_synthesize_stage(
 
         if combined_kb <= effective_limit:
             try:
-                raw = call_llm_with_key_rotation(
+                raw = call_llm_with_failover(
                     stage=config.synthesize_stage,
-                    api_keys=api_keys,
+                    endpoint_states=endpoint_states,
                     system_prompt=synthesize_system_prompt,
                     user_prompt=user_prompt,
                     runtime=config.runtime,
@@ -1818,9 +1941,9 @@ def run_synthesize_stage(
                 )
 
                 try:
-                    raw = call_llm_with_key_rotation(
+                    raw = call_llm_with_failover(
                         stage=config.synthesize_stage,
-                        api_keys=api_keys,
+                        endpoint_states=endpoint_states,
                         system_prompt=synthesize_system_prompt,
                         user_prompt=sub_prompt,
                         runtime=config.runtime,
@@ -1885,7 +2008,7 @@ def _resolve_tag_mapping(
     tag_names: List[str],
     merge_config: SynthesizeMergeConfig,
     stage: StageConfig,
-    api_keys: List[str],
+    endpoint_states: List[EndpointState],
     runtime: RuntimeConfig,
 ) -> Dict[str, List[str]]:
     """解析标签 → 大分类映射。手动映射优先，否则走 LLM。"""
@@ -1900,9 +2023,9 @@ def _resolve_tag_mapping(
     print("[synthesize] 使用 LLM 自动分组标签...")
     prompt = _build_grouping_prompt(tag_names, merge_config.target_categories)
     try:
-        raw = call_llm_with_key_rotation(
+        raw = call_llm_with_failover(
             stage=stage,
-            api_keys=api_keys,
+            endpoint_states=endpoint_states,
             system_prompt="你是一个分类专家。请严格按要求输出 JSON。",
             user_prompt=prompt,
             runtime=runtime,
@@ -1965,6 +2088,14 @@ def _apply_tag_grouping(
 # ── Pipeline 入口 ──
 
 
+def _fmt_endpoints(stage: StageConfig) -> str:
+    """格式化端点信息用于日志输出。"""
+    if stage.endpoints:
+        parts = [f"{ep.name}({ep.api_url})" for ep in stage.endpoints]
+        return " → ".join(parts)
+    return stage.api_url or "default"
+
+
 def run_pipeline(config: PipelineConfig, only_stage: str) -> None:
     config.output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1975,10 +2106,8 @@ def run_pipeline(config: PipelineConfig, only_stage: str) -> None:
         f"[pipeline] extract: {config.extract_stage.provider}/{config.extract_stage.model} | "
         f"synthesize: {config.synthesize_stage.provider}/{config.synthesize_stage.model}"
     )
-    print(
-        f"[pipeline] extract_api_url: {config.extract_stage.api_url or 'default'} | "
-        f"synthesize_api_url: {config.synthesize_stage.api_url or 'default'}"
-    )
+    print(f"[pipeline] extract 端点: {_fmt_endpoints(config.extract_stage)}")
+    print(f"[pipeline] synthesize 端点: {_fmt_endpoints(config.synthesize_stage)}")
 
     extract_dir: Path | None = None
 
