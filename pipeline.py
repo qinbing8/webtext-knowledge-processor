@@ -1684,6 +1684,93 @@ def _extract_with_retry(
     raise PipelineError(f"{label}: 重试 {max_retries} 次后仍失败")
 
 
+# ---------------------------------------------------------------------------
+#  并发执行结构化日志
+# ---------------------------------------------------------------------------
+
+
+def _extract_unit_label(unit: Dict[str, Any]) -> str:
+    """从 extract 工作单元中提取可读标签。"""
+    if unit["type"] == "single":
+        return unit["name"]
+    elif unit["type"] == "batch":
+        return f"批次 {unit['batch_idx']}"
+    elif unit["type"] == "chunk_group":
+        return unit["name"]
+    return str(unit.get("name", "unknown"))
+
+
+class _ConcurrentLog:
+    """线程安全的并发执行日志记录器。
+
+    记录每个工作单元的 worker 名、标签、状态 (ok/error/skip)、耗时和可选错误信息，
+    完成后可写入 JSON 文件并打印汇总统计。
+    """
+
+    def __init__(self, stage: str, max_workers: int, total_units: int) -> None:
+        self.stage = stage
+        self.max_workers = max_workers
+        self.total_units = total_units
+        self._records: List[Dict[str, Any]] = []
+        self._lock = threading.Lock()
+        self._start_time = time.time()
+
+    def record(
+        self,
+        worker: str,
+        unit: str,
+        status: str,
+        duration_s: float,
+        error: str | None = None,
+    ) -> None:
+        entry: Dict[str, Any] = {
+            "worker": worker,
+            "unit": unit,
+            "status": status,
+            "duration_s": round(duration_s, 3),
+        }
+        if error:
+            entry["error"] = error[:500]
+        with self._lock:
+            self._records.append(entry)
+
+    def write_log(self, log_dir: Path) -> Path:
+        """将结构化日志写入 JSON 文件，返回文件路径。"""
+        log_dir.mkdir(parents=True, exist_ok=True)
+        timestamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+        log_path = log_dir / f"concurrent_{self.stage}_{timestamp}.json"
+        total_seconds = round(time.time() - self._start_time, 2)
+
+        summary: Dict[str, int] = {"ok": 0, "error": 0, "skip": 0}
+        with self._lock:
+            for r in self._records:
+                summary[r["status"]] = summary.get(r["status"], 0) + 1
+            records_snapshot = list(self._records)
+
+        payload = {
+            "stage": self.stage,
+            "max_workers": self.max_workers,
+            "total_units": self.total_units,
+            "total_seconds": total_seconds,
+            "summary": summary,
+            "records": records_snapshot,
+        }
+        log_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        return log_path
+
+    def print_summary(self) -> None:
+        """打印汇总统计。"""
+        total_seconds = round(time.time() - self._start_time, 2)
+        with self._lock:
+            ok = sum(1 for r in self._records if r["status"] == "ok")
+            err = sum(1 for r in self._records if r["status"] == "error")
+            skip = sum(1 for r in self._records if r["status"] == "skip")
+        print(
+            f"[{self.stage}] 并发统计: ok={ok} error={err} skip={skip} "
+            f"总耗时={total_seconds}s workers={self.max_workers}"
+        )
+
+
 def run_extract_stage(
     config: PipelineConfig,
 ) -> Path:
@@ -1835,20 +1922,41 @@ def run_extract_stage(
     stop_event = threading.Event()
     progress_lock = threading.Lock()
     done_count = [0]
+    worker_id_counter = [0]
+    worker_id_lock = threading.Lock()
+    clog = _ConcurrentLog("extract", config.concurrency.max_workers, total_units)
 
     def _process_extract_unit(unit: Dict[str, Any]) -> None:
         """处理单个 extract 工作单元（线程安全）。"""
         if stop_event.is_set():
+            clog.record(
+                worker=threading.current_thread().name,
+                unit=_extract_unit_label(unit),
+                status="skip",
+                duration_s=0.0,
+            )
             return
 
         with progress_lock:
             done_count[0] += 1
             seq = done_count[0]
 
+        # 为并发模式分配 worker ID
+        w_tag = ""
+        if max_workers > 1:
+            with worker_id_lock:
+                wid = worker_id_counter[0]
+                worker_id_counter[0] += 1
+            w_tag = f" W{wid % max_workers}"
+
+        t0 = time.time()
+        unit_label = _extract_unit_label(unit)
+        worker_name = threading.current_thread().name
+
         try:
             if unit["type"] == "single":
                 name = unit["name"]
-                print(f"[extract {seq}/{total_units}] {name} (编码: {unit['encoding']})")
+                print(f"[extract{w_tag} {seq}/{total_units}] {name} (编码: {unit['encoding']})")
                 md = _extract_with_retry(
                     lambda _n=name, _t=unit["text"]: _extract_single(config, endpoint_states, _n, _t),
                     label=name,
@@ -1857,14 +1965,14 @@ def run_extract_stage(
                 out_path.write_text(md, encoding="utf-8")
                 with manifest_lock:
                     _append_manifest(manifest_path, [name])
-                print(f"[extract] → {out_path.name}")
+                print(f"[extract{w_tag}] → {out_path.name}")
 
             elif unit["type"] == "batch":
                 batch_idx = unit["batch_idx"]
                 batch_names = unit["names"]
                 files_for_prompt = unit["files"]
                 print(
-                    f"[extract {seq}/{total_units}] 批次 {batch_idx}: "
+                    f"[extract{w_tag} {seq}/{total_units}] 批次 {batch_idx}: "
                     f"{len(batch_names)} 个文件, {unit['size_kb']:.1f}KB"
                 )
                 try:
@@ -1876,16 +1984,17 @@ def run_extract_stage(
                     out_path.write_text(md, encoding="utf-8")
                     with manifest_lock:
                         _append_manifest(manifest_path, batch_names)
-                    print(f"[extract] → {out_path.name}")
+                    print(f"[extract{w_tag}] → {out_path.name}")
                 except EndpointsExhaustedError:
                     raise
                 except PipelineError as exc:
                     # 批量失败 → 逐文件回退
-                    print(f"[extract] 批次失败（重试耗尽）: {exc}，逐文件回退")
+                    print(f"[extract{w_tag}] 批次失败（重试耗尽）: {exc}，逐文件回退")
                     for fi, (fname, ftext) in enumerate(files_for_prompt, 1):
                         if stop_event.is_set():
+                            clog.record(worker=worker_name, unit=unit_label, status="skip", duration_s=time.time() - t0)
                             return
-                        print(f"[extract] 回退处理: {fname} ({fi}/{len(files_for_prompt)})")
+                        print(f"[extract{w_tag}] 回退处理: {fname} ({fi}/{len(files_for_prompt)})")
                         try:
                             md = _extract_with_retry(
                                 lambda _n=fname, _t=ftext: _extract_single(config, endpoint_states, _n, _t),
@@ -1898,17 +2007,18 @@ def run_extract_stage(
                         except EndpointsExhaustedError:
                             raise
                         except PipelineError as single_exc:
-                            print(f"[extract] 单文件也失败（重试耗尽）: {fname}: {single_exc}")
+                            print(f"[extract{w_tag}] 单文件也失败（重试耗尽）: {fname}: {single_exc}")
 
             elif unit["type"] == "chunk_group":
                 name = unit["name"]
                 chunks = unit["chunks"]
                 for t in chunks:
                     if stop_event.is_set():
+                        clog.record(worker=worker_name, unit=unit_label, status="skip", duration_s=time.time() - t0)
                         return
                     ci = t["chunk_index"]
                     ct = t["chunk_total"]
-                    print(f"[extract {seq}/{total_units}] {name} 块 {ci}/{ct}")
+                    print(f"[extract{w_tag} {seq}/{total_units}] {name} 块 {ci}/{ct}")
                     chunk_label = f"{name} (块 {ci}/{ct})"
                     md = _extract_with_retry(
                         lambda _l=chunk_label, _t=t["text"]: _extract_single(config, endpoint_states, _l, _t),
@@ -1920,11 +2030,15 @@ def run_extract_stage(
                 with manifest_lock:
                     _append_manifest(manifest_path, [name])
 
+            clog.record(worker=worker_name, unit=unit_label, status="ok", duration_s=time.time() - t0)
+
         except EndpointsExhaustedError:
+            clog.record(worker=worker_name, unit=unit_label, status="error", duration_s=time.time() - t0, error="EndpointsExhausted")
             stop_event.set()
             raise
         except PipelineError as exc:
-            print(f"[extract] 失败（重试耗尽）: {exc}")
+            clog.record(worker=worker_name, unit=unit_label, status="error", duration_s=time.time() - t0, error=str(exc))
+            print(f"[extract{w_tag}] 失败（重试耗尽）: {exc}")
 
     # ── 执行（串行 or 并发） ──
     max_workers = config.concurrency.max_workers
@@ -1954,6 +2068,11 @@ def run_extract_stage(
                 print("\n[extract] 用户中断，取消剩余任务...")
                 executor.shutdown(wait=False, cancel_futures=True)
                 raise
+
+    # ── 并发日志输出 ──
+    if max_workers > 1:
+        clog.write_log(log_dir)
+        clog.print_summary()
 
     print(f"[extract] 阶段完成，输出目录：{extract_dir}")
     return extract_dir
@@ -2197,10 +2316,19 @@ def run_synthesize_stage(
     manifest_lock = threading.Lock()
     stop_event = threading.Event()
     topic_files_lock = threading.Lock()
+    synth_worker_id_counter = [0]
+    synth_worker_id_lock = threading.Lock()
+    synth_clog = _ConcurrentLog("synthesize", config.concurrency.max_workers, total)
 
     def _process_topic(i: int, topic_name: str) -> str | None:
         """处理单个主题（线程安全），返回输出文件名或 None。"""
         if stop_event.is_set():
+            synth_clog.record(
+                worker=threading.current_thread().name,
+                unit=topic_name,
+                status="skip",
+                duration_s=0.0,
+            )
             return None
 
         units = merged_buckets[topic_name]
@@ -2210,18 +2338,32 @@ def run_synthesize_stage(
         filename = f"{i:02d}_{safe_filename(topic_name)}.md"
         topic_path = topics_dir / filename
 
+        # 为并发模式分配 worker ID
+        s_max_workers = config.concurrency.max_workers
+        s_tag = ""
+        if s_max_workers > 1:
+            with synth_worker_id_lock:
+                swid = synth_worker_id_counter[0]
+                synth_worker_id_counter[0] += 1
+            s_tag = f" W{swid % s_max_workers}"
+
+        t0 = time.time()
+        worker_name = threading.current_thread().name
+
         # 断点续传：跳过已完成的主题
         if topic_name in done_topics and topic_path.is_file():
-            print(f"[synthesize {i}/{total}] {topic_name} (已处理，跳过)")
+            print(f"[synthesize{s_tag} {i}/{total}] {topic_name} (已处理，跳过)")
+            synth_clog.record(worker=worker_name, unit=topic_name, status="skip", duration_s=0.0)
             return filename
 
-        print(f"[synthesize {i}/{total}] {topic_name} ({len(units)} 条, {combined_kb:.1f}KB)")
+        print(f"[synthesize{s_tag} {i}/{total}] {topic_name} ({len(units)} 条, {combined_kb:.1f}KB)")
 
         if len(units) == 1:
-            print(f"[synthesize] → 仅 1 条，直接写入: {filename}")
+            print(f"[synthesize{s_tag}] → 仅 1 条，直接写入: {filename}")
             topic_path.write_text(units[0], encoding="utf-8")
             with manifest_lock:
                 _append_manifest(topic_done_path, [topic_name])
+            synth_clog.record(worker=worker_name, unit=topic_name, status="ok", duration_s=time.time() - t0)
             return filename
 
         user_prompt = (
@@ -2242,10 +2384,10 @@ def run_synthesize_stage(
                 result = strip_code_fences(raw)
                 topic_path.write_text(result, encoding="utf-8")
                 result_kb = len(result.encode("utf-8")) / 1024.0
-                print(f"[synthesize] → {filename} ({result_kb:.1f}KB)")
+                print(f"[synthesize{s_tag}] → {filename} ({result_kb:.1f}KB)")
             else:
                 print(
-                    f"[synthesize] 主题过大 ({combined_kb:.1f}KB > {effective_limit}KB)，分批处理"
+                    f"[synthesize{s_tag}] 主题过大 ({combined_kb:.1f}KB > {effective_limit}KB)，分批处理"
                 )
                 sub_batches = compute_batches(
                     [{"text": u} for u in units],
@@ -2256,10 +2398,11 @@ def run_synthesize_stage(
                 sub_results: List[str] = []
                 for si, sub_batch in enumerate(sub_batches, 1):
                     if stop_event.is_set():
+                        synth_clog.record(worker=worker_name, unit=topic_name, status="skip", duration_s=time.time() - t0)
                         return None
                     sub_text = "\n\n---\n\n".join(item["text"] for item in sub_batch)
                     sub_kb = len(sub_text.encode("utf-8")) / 1024.0
-                    print(f"[synthesize]   子批 {si}/{len(sub_batches)}: {sub_kb:.1f}KB")
+                    print(f"[synthesize{s_tag}]   子批 {si}/{len(sub_batches)}: {sub_kb:.1f}KB")
 
                     sub_prompt = (
                         f"以下是关于【{topic_name}】这一主题的部分知识单元"
@@ -2280,21 +2423,25 @@ def run_synthesize_stage(
                     except PipelineError as exc:
                         if isinstance(exc, EndpointsExhaustedError):
                             raise
-                        print(f"[synthesize]   子批 {si} 失败: {exc}，保留原文")
+                        print(f"[synthesize{s_tag}]   子批 {si} 失败: {exc}，保留原文")
                         sub_results.append(sub_text)
 
                 final_text = "\n\n---\n\n".join(sub_results)
                 topic_path.write_text(final_text, encoding="utf-8")
                 final_kb = len(final_text.encode("utf-8")) / 1024.0
-                print(f"[synthesize] → {filename} ({final_kb:.1f}KB)")
+                print(f"[synthesize{s_tag}] → {filename} ({final_kb:.1f}KB)")
+
+            synth_clog.record(worker=worker_name, unit=topic_name, status="ok", duration_s=time.time() - t0)
 
         except EndpointsExhaustedError:
+            synth_clog.record(worker=worker_name, unit=topic_name, status="error", duration_s=time.time() - t0, error="EndpointsExhausted")
             stop_event.set()
             raise
         except PipelineError as exc:
-            print(f"[synthesize] 失败: {topic_name}: {exc}")
+            synth_clog.record(worker=worker_name, unit=topic_name, status="error", duration_s=time.time() - t0, error=str(exc))
+            print(f"[synthesize{s_tag}] 失败: {topic_name}: {exc}")
             topic_path.write_text(combined_text, encoding="utf-8")
-            print(f"[synthesize] → 降级为原文拼接: {filename}")
+            print(f"[synthesize{s_tag}] → 降级为原文拼接: {filename}")
 
         with manifest_lock:
             _append_manifest(topic_done_path, [topic_name])
@@ -2336,6 +2483,11 @@ def run_synthesize_stage(
                 print("\n[synthesize] 用户中断，取消剩余任务...")
                 executor.shutdown(wait=False, cancel_futures=True)
                 raise
+
+    # ── 并发日志输出 ──
+    if max_workers > 1:
+        synth_clog.write_log(log_dir)
+        synth_clog.print_summary()
 
     # 排序确保文件列表顺序一致
     topic_files.sort()
