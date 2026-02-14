@@ -26,6 +26,9 @@ _smoke_output/
 # Claude 配置（本地）
 .claude/
 
+# 审查产物
+review_result.json
+
 # 其他非代码文件
 网文新人指南/
 系统提示词_模板.md

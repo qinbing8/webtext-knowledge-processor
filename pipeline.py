@@ -1544,6 +1544,19 @@ def _compute_extract_fingerprint(extract_dir: Path) -> str:
     return h.hexdigest()[:16]
 
 
+def _compute_topic_fingerprint(units: List[str]) -> str:
+    """基于主题内所有知识单元计算指纹，用于增量缓存。"""
+    h = hashlib.sha256()
+    for unit in sorted(units):
+        h.update(unit.encode("utf-8"))
+    return h.hexdigest()[:16]
+
+
+def _save_topic_fingerprints(path: Path, merge_sig: str, fps: dict) -> None:
+    """持久化 per-topic 指纹缓存。"""
+    dump_json(path, {"merge_sig": merge_sig, "topics": fps})
+
+
 def split_large_text(text: str, max_size_kb: float) -> List[str]:
     """按段落边界拆分超大文本为 <= max_size_kb 的块。"""
     max_bytes = int(max_size_kb * 1024)
@@ -2261,19 +2274,20 @@ def run_synthesize_stage(
             except (json.JSONDecodeError, KeyError):
                 pass
 
-    # ── 逐主题断点续传 manifest ──
-    topic_done_path = intermediate_dir / "synthesize_topic_done.txt"
+    # ── per-topic 指纹缓存（增量模式：仅重做输入变化的主题） ──
+    topic_fp_path = intermediate_dir / "synthesize_topic_fingerprints.json"
+    cached_topic_fps: dict[str, str] = {}
+    if topic_fp_path.is_file():
+        try:
+            fp_data = json.loads(topic_fp_path.read_text(encoding="utf-8"))
+            # merge 配置变更 → 全部失效
+            if fp_data.get("merge_sig") == merge_sig:
+                cached_topic_fps = fp_data.get("topics", {})
+        except (json.JSONDecodeError, KeyError):
+            pass
 
-    # 指纹变更 → 清除逐主题进度（extract 内容已变，旧主题结果无效）
-    if fingerprint_path.is_file():
-        stored_fp = fingerprint_path.read_text(encoding="utf-8").strip()
-        if stored_fp != current_fingerprint and topic_done_path.is_file():
-            print("[synthesize] extract 内容已变更，清除逐主题进度")
-            topic_done_path.unlink()
-
-    # 提前写入指纹，使逐主题 manifest 与当前指纹关联
+    # 提前写入指纹，使全局 manifest 与当前指纹关联
     fingerprint_path.write_text(current_fingerprint, encoding="utf-8")
-    done_topics = _read_manifest(topic_done_path)
 
     # ── Phase 1: 按分类标签归组（纯代码，零信息损失） ──
     print("[synthesize] Phase 1: 按分类标签归组知识单元...")
@@ -2350,9 +2364,12 @@ def run_synthesize_stage(
         t0 = time.time()
         worker_name = threading.current_thread().name
 
-        # 断点续传：跳过已完成的主题
-        if topic_name in done_topics and topic_path.is_file():
-            print(f"[synthesize{s_tag} {i}/{total}] {topic_name} (已处理，跳过)")
+        # 增量缓存：主题输入未变则跳过
+        current_fp = _compute_topic_fingerprint(units)
+        if (topic_name in cached_topic_fps and
+                cached_topic_fps[topic_name] == current_fp and
+                topic_path.is_file()):
+            print(f"[synthesize{s_tag} {i}/{total}] {topic_name} (内容未变，跳过)")
             synth_clog.record(worker=worker_name, unit=topic_name, status="skip", duration_s=0.0)
             return filename
 
@@ -2362,7 +2379,8 @@ def run_synthesize_stage(
             print(f"[synthesize{s_tag}] → 仅 1 条，直接写入: {filename}")
             topic_path.write_text(units[0], encoding="utf-8")
             with manifest_lock:
-                _append_manifest(topic_done_path, [topic_name])
+                cached_topic_fps[topic_name] = current_fp
+                _save_topic_fingerprints(topic_fp_path, merge_sig, cached_topic_fps)
             synth_clog.record(worker=worker_name, unit=topic_name, status="ok", duration_s=time.time() - t0)
             return filename
 
@@ -2444,7 +2462,8 @@ def run_synthesize_stage(
             print(f"[synthesize{s_tag}] → 降级为原文拼接: {filename}")
 
         with manifest_lock:
-            _append_manifest(topic_done_path, [topic_name])
+            cached_topic_fps[topic_name] = current_fp
+            _save_topic_fingerprints(topic_fp_path, merge_sig, cached_topic_fps)
         return filename
 
     # ── 执行（串行 or 并发） ──
