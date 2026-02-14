@@ -7,8 +7,20 @@ stages:
   extract:
     provider: "claude"
     model: "claude-opus-4-6"
+    # 单端点旧格式（向后兼容）
     api_url: "https://hotaruapi.com/v1/messages"
     api_key: "YOUR_API_KEY_HERE"
+    # 多端点新格式（与上面二选一，优先级更高）:
+    # endpoints:
+    #   - name: "hotaru_native"
+    #     api_url: "https://hotaruapi.com/v1/messages"
+    #     api_key: "sk-xxx"
+    #     api_type: "anthropic"       # 可选，覆盖 stage 级别的 api_type
+    #     model: "claude-opus-4-6"    # 可选，覆盖 stage 级别的 model
+    #   - name: "openai_compat"
+    #     api_url: "https://other-proxy.com/v1/chat/completions"
+    #     api_key: "sk-yyy"
+    #     api_type: "openai"          # 该端点走 OpenAI 兼容格式
     system_prompt: |
       你是资深起点男频网文知识架构师（Senior Qidian Web-Fiction Architect）。
       你的核心目标是：将混乱的原始输入（直播字幕、OCR、笔记）转化为结构化、可执行的知识体系。
@@ -61,6 +73,7 @@ stages:
       - 具体书名/作者名必须保留（严禁杜撰书名）
       - 每个独立的知识点都是一个独立的 ## 单元，不要合并不同知识点
       - 不要输出 JSON，只输出 Markdown
+      - 输出完成后，必须在最后单独一行写 <!-- END --> 作为结束标记
 
   synthesize:
     provider: "claude"
@@ -91,6 +104,7 @@ stages:
       - 禁止将多个不同案例合并为一句概括
       - 禁止添加原文中不存在的信息
       - 禁止压缩具体数字（追读数、收藏数等必须原样保留）
+      - 输出完成后，必须在最后单独一行写 <!-- END --> 作为结束标记
     grouping:
       target_categories: 15
       use_llm: false
@@ -159,7 +173,10 @@ batching:
     openai: 150
   extract:
     enabled: true
-    max_files_per_batch: 5
+    max_files_per_batch: 50
     max_batch_size_kb: 200
   synthesize:
     max_batch_size_kb: 200
+
+concurrency:
+  max_workers: 3  # 并发 LLM 调用数（1=串行，建议 2-5）

@@ -9,8 +9,10 @@ import ssl
 import os
 import re
 import sys
+import threading
 import time
 import traceback
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Tuple
@@ -40,6 +42,7 @@ class Endpoint:
     api_url: str
     api_key: str
     api_type: str = ""  # 可选覆盖，为空则 fallback 到 StageConfig.api_type
+    model: str = ""     # 可选覆盖，为空则 fallback 到 StageConfig.model
 
 
 @dataclass(frozen=True)
@@ -67,7 +70,7 @@ class StageConfig:
 
 # ── 熔断参数 ──
 CIRCUIT_FAILURE_THRESHOLD = 3    # 连续失败 N 次触发熔断
-CIRCUIT_COOLDOWN_SECONDS = 60    # 熔断冷却期（秒）
+CIRCUIT_COOLDOWN_SECONDS = 18000  # 熔断冷却期（5 小时）
 
 
 class EndpointState:
@@ -77,32 +80,77 @@ class EndpointState:
     跟踪连续失败次数并在达到阈值时触发熔断。
     """
 
-    def __init__(self, endpoint: Endpoint) -> None:
+    def __init__(self, endpoint: Endpoint, log_dir: Path | None = None) -> None:
         self.endpoint = endpoint
         self.consecutive_failures = 0
         self.circuit_open_until = 0.0
+        self.log_dir = log_dir
+        self._last_errors: List[str] = []
+        self._lock = threading.Lock()  # 线程安全：保护熔断状态读写
 
     @property
     def name(self) -> str:
         return self.endpoint.name
 
     def is_available(self) -> bool:
-        if self.consecutive_failures < CIRCUIT_FAILURE_THRESHOLD:
-            return True
-        return time.time() >= self.circuit_open_until
+        with self._lock:
+            if self.consecutive_failures < CIRCUIT_FAILURE_THRESHOLD:
+                return True
+            return time.time() >= self.circuit_open_until
 
     def record_success(self) -> None:
-        self.consecutive_failures = 0
-        self.circuit_open_until = 0.0
+        with self._lock:
+            self.consecutive_failures = 0
+            self.circuit_open_until = 0.0
 
-    def record_failure(self) -> None:
-        self.consecutive_failures += 1
-        if self.consecutive_failures >= CIRCUIT_FAILURE_THRESHOLD:
-            self.circuit_open_until = time.time() + CIRCUIT_COOLDOWN_SECONDS
-            print(
-                f"[failover] 端点 '{self.name}' 连续失败 "
-                f"{self.consecutive_failures} 次，熔断 {CIRCUIT_COOLDOWN_SECONDS} 秒"
-            )
+    def record_failure(self, error_msg: str = "") -> None:
+        with self._lock:
+            self.consecutive_failures += 1
+            if error_msg:
+                self._last_errors.append(error_msg)
+            if self.consecutive_failures >= CIRCUIT_FAILURE_THRESHOLD:
+                self.circuit_open_until = time.time() + CIRCUIT_COOLDOWN_SECONDS
+                cooldown_hours = CIRCUIT_COOLDOWN_SECONDS / 3600
+                print(
+                    f"\n{'='*60}\n"
+                    f"[failover] 端点 '{self.name}' 连续失败 "
+                    f"{self.consecutive_failures} 次，熔断 {cooldown_hours:.1f} 小时\n"
+                    f"[failover] 请检查上游端点配置（模型名称、API Key、服务状态）\n"
+                    f"{'='*60}"
+                )
+                self._write_circuit_log()
+
+    def _write_circuit_log(self) -> None:
+        """熔断时写入详细日志文件。"""
+        if not self.log_dir:
+            return
+        self.log_dir.mkdir(parents=True, exist_ok=True)
+        timestamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+        log_path = self.log_dir / f"circuit_break_{self.name}_{timestamp}.log"
+        cooldown_hours = CIRCUIT_COOLDOWN_SECONDS / 3600
+        lines = [
+            f"时间: {dt.datetime.now().isoformat(timespec='seconds')}",
+            f"端点: {self.name}",
+            f"API URL: {sanitize_url_for_log(self.endpoint.api_url)}",
+            f"模型: {self.endpoint.model or '(继承 stage 配置)'}",
+            f"API 类型: {self.endpoint.api_type or '(继承 stage 配置)'}",
+            f"连续失败次数: {self.consecutive_failures}",
+            f"熔断冷却: {cooldown_hours:.1f} 小时",
+            "",
+            "最近错误:",
+        ]
+        for i, err in enumerate(self._last_errors[-5:], 1):
+            lines.append(f"  {i}. {err[:500]}")
+        lines.extend([
+            "",
+            "建议排查:",
+            "  1. 检查端点是否支持配置的模型名称",
+            "  2. 检查 API Key 是否有效",
+            "  3. 检查上游服务是否正常运行",
+            "  4. 确认模型名称拼写正确（如 claude-opus-4-6 vs claude-opus-4-6-thinking）",
+        ])
+        log_path.write_text("\n".join(lines), encoding="utf-8")
+        print(f"[failover] 熔断日志已写入：{log_path}")
 
 
 @dataclass(frozen=True)
@@ -122,13 +170,19 @@ class ProviderLimits:
 @dataclass(frozen=True)
 class ExtractBatchingConfig:
     enabled: bool = True
-    max_files_per_batch: int = 5
+    max_files_per_batch: int = 50
     max_batch_size_kb: int = 353
 
 
 @dataclass(frozen=True)
 class SynthesizeBatchingConfig:
     max_batch_size_kb: int = 353
+
+
+@dataclass(frozen=True)
+class ConcurrencyConfig:
+    """并发配置：控制 ThreadPoolExecutor 的工作线程数。"""
+    max_workers: int = 3  # 并发 LLM 调用数
 
 
 @dataclass(frozen=True)
@@ -155,6 +209,7 @@ class PipelineConfig:
     runtime: RuntimeConfig
     batching: BatchingConfig = field(default_factory=BatchingConfig)
     merge: SynthesizeMergeConfig = field(default_factory=SynthesizeMergeConfig)
+    concurrency: ConcurrencyConfig = field(default_factory=ConcurrencyConfig)
 
 
 def parse_args() -> argparse.Namespace:
@@ -237,7 +292,7 @@ def load_config(config_path: Path) -> PipelineConfig:
         provider_limits=provider_limits,
         extract=ExtractBatchingConfig(
             enabled=bool(extract_batch_raw.get("enabled", True)),
-            max_files_per_batch=int(extract_batch_raw.get("max_files_per_batch", 5)),
+            max_files_per_batch=int(extract_batch_raw.get("max_files_per_batch", 50)),
             max_batch_size_kb=extract_max_batch_kb,
         ),
         synthesize=SynthesizeBatchingConfig(
@@ -260,6 +315,12 @@ def load_config(config_path: Path) -> PipelineConfig:
         mapping=grouping_mapping,
     )
 
+    # ── 解析 concurrency 配置 ──
+    concurrency_raw = raw.get("concurrency", {}) or {}
+    concurrency = ConcurrencyConfig(
+        max_workers=max(1, int(concurrency_raw.get("max_workers", 3))),
+    )
+
     return PipelineConfig(
         api_keys={str(k).lower(): str(v) for k, v in api_keys.items()},
         extract_stage=extract_stage,
@@ -269,6 +330,7 @@ def load_config(config_path: Path) -> PipelineConfig:
         runtime=runtime,
         batching=batching,
         merge=merge_config,
+        concurrency=concurrency,
     )
 
 
@@ -350,7 +412,8 @@ def build_stage_config(stage_name: str, raw_stage: Any) -> StageConfig:
                     f"阶段配置错误：stages.{stage_name}.endpoints[{i}].api_type "
                     f"仅支持 openai / anthropic / gemini"
                 )
-            endpoints.append(Endpoint(name=ep_name, api_url=ep_url, api_key=ep_key, api_type=ep_api_type))
+            ep_model = str(ep_raw.get("model", "")).strip()
+            endpoints.append(Endpoint(name=ep_name, api_url=ep_url, api_key=ep_key, api_type=ep_api_type, model=ep_model))
 
     return StageConfig(
         provider=normalized_provider,
@@ -423,6 +486,18 @@ def safe_filename(name: str) -> str:
     value = value.replace(" ", "_")
     value = value.strip("._")
     return value or "untitled"
+
+
+def _batch_output_name(names: List[str]) -> str:
+    """基于批次内文件名列表生成确定性文件名。
+
+    使用文件名排序后的 SHA-256 前 8 位，确保同一组文件
+    无论运行顺序如何，始终映射到相同的输出文件名。
+    避免断点续传时因批次重编号而覆盖已完成批次的结果。
+    """
+    key = "|".join(sorted(names))
+    h = hashlib.sha256(key.encode("utf-8")).hexdigest()[:8]
+    return f"batch_{h}.md"
 
 
 # ── API Key 工具 ──
@@ -654,7 +729,8 @@ def post_json(
     )
 
     http_retries_left = runtime.max_retries
-    network_retries_left = NETWORK_MAX_RETRIES
+    network_retries_left = NETWORK_MAX_RETRIES if runtime.max_retries > 0 else 0
+    network_retries_initial = network_retries_left
     max_total = runtime.max_retries + 1 + NETWORK_MAX_RETRIES
 
     for _ in range(max_total):
@@ -705,7 +781,7 @@ def post_json(
                 time.sleep(NETWORK_RETRY_INTERVAL)
                 continue
             raise PipelineError(
-                f"网络连接中断，{NETWORK_MAX_RETRIES} 次重试后仍失败，"
+                f"网络连接中断（重试 {network_retries_initial} 次后仍失败），"
                 f"URL：{safe_url}，最后异常：{type(exc).__name__}: {exc}"
             ) from exc
 
@@ -783,17 +859,21 @@ def call_openai(
     user_prompt: str,
     runtime: RuntimeConfig,
     api_url: str | None = None,
+    extra_messages: List[Dict[str, str]] | None = None,
 ) -> str:
     url = normalize_openai_url(api_url)
     is_responses_api = parse.urlsplit(url).path.rstrip("/").endswith("/responses")
 
     if is_responses_api:
+        input_messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ]
+        if extra_messages:
+            input_messages.extend(extra_messages)
         payload = {
             "model": model,
-            "input": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ],
+            "input": input_messages,
             "temperature": 0.2,
         }
         resp = post_json(
@@ -830,12 +910,15 @@ def call_openai(
         raise PipelineError("OpenAI Responses 响应中未解析到有效文本")
 
     # Chat Completions API - 使用流式请求
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_prompt},
+    ]
+    if extra_messages:
+        messages.extend(extra_messages)
     payload = {
         "model": model,
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
-        ],
+        "messages": messages,
         "temperature": 0.2,
         "stream": True,
     }
@@ -946,9 +1029,11 @@ def _call_streaming_with_retry(
     }
 
     http_retries_left = runtime.max_retries
-    network_retries_left = _NETWORK_MAX_RETRIES
-    content_retries_left = _CONTENT_MAX_RETRIES
-    max_total = runtime.max_retries + 1 + _NETWORK_MAX_RETRIES + _CONTENT_MAX_RETRIES
+    network_retries_left = _NETWORK_MAX_RETRIES if runtime.max_retries > 0 else 0
+    network_retries_initial = network_retries_left
+    content_retries_left = _CONTENT_MAX_RETRIES if runtime.max_retries > 0 else 0
+    content_retries_initial = content_retries_left
+    max_total = runtime.max_retries + 1 + network_retries_left + content_retries_left
 
     for _ in range(max_total):
         req = request.Request(url=url, data=body, method="POST", headers=full_headers)
@@ -968,20 +1053,20 @@ def _call_streaming_with_retry(
             if not result:
                 if content_retries_left > 0:
                     content_retries_left -= 1
-                    attempt = _CONTENT_MAX_RETRIES - content_retries_left
+                    attempt = content_retries_initial - content_retries_left
                     category = classify_error(
                         PipelineError(f"{provider} 流式响应未返回文本")
                     )
                     print(
                         f"[{provider}] 【{category}】流式响应为空，"
                         f"{_CONTENT_RETRY_INTERVAL}秒后重试 "
-                        f"({attempt}/{_CONTENT_MAX_RETRIES})..."
+                        f"({attempt}/{content_retries_initial})..."
                     )
                     time.sleep(_CONTENT_RETRY_INTERVAL)
                     continue
                 raise PipelineError(
                     f"{provider} 流式响应未返回文本"
-                    f"（重试 {_CONTENT_MAX_RETRIES} 次后仍失败）"
+                    f"（重试 {content_retries_initial} 次后仍失败）"
                 )
 
             return result
@@ -1034,12 +1119,12 @@ def _call_streaming_with_retry(
                     f"[{provider}] 【{category}】连接中断 "
                     f"({type(exc).__name__}: {exc})，"
                     f"{_NETWORK_RETRY_INTERVAL}秒后重试 "
-                    f"({attempt}/{_NETWORK_MAX_RETRIES})..."
+                    f"({attempt}/{network_retries_initial})..."
                 )
                 time.sleep(_NETWORK_RETRY_INTERVAL)
                 continue
             raise PipelineError(
-                f"网络连接中断，{_NETWORK_MAX_RETRIES} 次重试后仍失败，"
+                f"网络连接中断（重试 {network_retries_initial} 次后仍失败），"
                 f"URL：{safe_url}，错误分类：【{category}】，"
                 f"最后异常：{type(exc).__name__}: {exc}"
             ) from exc
@@ -1057,18 +1142,23 @@ def call_claude(
     user_prompt: str,
     runtime: RuntimeConfig,
     api_url: str | None = None,
+    extra_messages: List[Dict[str, str]] | None = None,
 ) -> str:
+    messages = [
+        {"role": "user", "content": [{"type": "text", "text": user_prompt}]},
+    ]
+    if extra_messages:
+        for em in extra_messages:
+            messages.append({
+                "role": em["role"],
+                "content": [{"type": "text", "text": em["content"]}],
+            })
     payload = {
         "model": model,
         "system": [{"type": "text", "text": system_prompt}],
         "max_tokens": 32768,
         "stream": True,
-        "messages": [
-            {
-                "role": "user",
-                "content": [{"type": "text", "text": user_prompt}],
-            }
-        ],
+        "messages": messages,
     }
 
     url = normalize_anthropic_url(api_url)
@@ -1093,18 +1183,21 @@ def call_gemini(
     user_prompt: str,
     runtime: RuntimeConfig,
     api_url: str | None = None,
+    extra_messages: List[Dict[str, str]] | None = None,
 ) -> str:
     url = normalize_gemini_url(api_url, model, api_key)
+    contents = [
+        {"role": "user", "parts": [{"text": user_prompt}]},
+    ]
+    if extra_messages:
+        for em in extra_messages:
+            role = "model" if em["role"] == "assistant" else "user"
+            contents.append({"role": role, "parts": [{"text": em["content"]}]})
     payload = {
         "systemInstruction": {
             "parts": [{"text": system_prompt}],
         },
-        "contents": [
-            {
-                "role": "user",
-                "parts": [{"text": user_prompt}],
-            }
-        ],
+        "contents": contents,
         "generationConfig": {
             "temperature": 0.2,
         },
@@ -1139,6 +1232,7 @@ def call_llm(
     system_prompt: str,
     user_prompt: str,
     runtime: RuntimeConfig,
+    extra_messages: List[Dict[str, str]] | None = None,
 ) -> str:
     # 将 system prompt 合并到 user prompt（兼容不支持 system 字段的中转站）
     if system_prompt.strip():
@@ -1150,42 +1244,46 @@ def call_llm(
     brief_system = "请严格按照 <instructions> 中的指令执行任务。"
 
     api_type = endpoint.api_type or stage.api_type
+    effective_model = endpoint.model or stage.model
     if api_type == "openai":
         return call_openai(
             endpoint.api_key,
-            stage.model,
+            effective_model,
             brief_system,
             merged_user,
             runtime,
             endpoint.api_url,
+            extra_messages=extra_messages,
         )
     if api_type == "anthropic":
         return call_claude(
             endpoint.api_key,
-            stage.model,
+            effective_model,
             brief_system,
             merged_user,
             runtime,
             endpoint.api_url,
+            extra_messages=extra_messages,
         )
     if api_type == "gemini":
         return call_gemini(
             endpoint.api_key,
-            stage.model,
+            effective_model,
             brief_system,
             merged_user,
             runtime,
             endpoint.api_url,
+            extra_messages=extra_messages,
         )
     raise PipelineError(f"不支持的 api_type：{api_type}")
 
 
 def _create_endpoint_states(
-    config: PipelineConfig, stage: StageConfig,
+    config: PipelineConfig, stage: StageConfig, log_dir: Path | None = None,
 ) -> List[EndpointState]:
     """从 StageConfig 创建端点状态列表。支持新旧两种配置格式。"""
     if stage.endpoints:
-        return [EndpointState(ep) for ep in stage.endpoints]
+        return [EndpointState(ep, log_dir=log_dir) for ep in stage.endpoints]
     # 旧格式兼容：api_url + api_key(s)
     api_keys = get_api_keys(config, stage.provider, stage.api_key)
     return [
@@ -1193,7 +1291,7 @@ def _create_endpoint_states(
             name=f"key_{i + 1}" if len(api_keys) > 1 else "default",
             api_url=stage.api_url or "",
             api_key=k,
-        ))
+        ), log_dir=log_dir)
         for i, k in enumerate(api_keys)
     ]
 
@@ -1204,8 +1302,14 @@ def call_llm_with_failover(
     system_prompt: str,
     user_prompt: str,
     runtime: RuntimeConfig,
+    extra_messages: List[Dict[str, str]] | None = None,
 ) -> str:
-    """多端点故障转移调用，带熔断机制。"""
+    """多端点故障转移调用，带熔断机制。
+
+    故障转移模式下禁用 L1 内部重试（max_retries=0），
+    每个端点仅发送 1 次 HTTP 请求，失败立即切换到下一个端点。
+    连续失败 3 次的端点触发熔断（冷却 5 小时）。
+    """
     available = [es for es in endpoint_states if es.is_available()]
     if not available:
         details = "\n".join(
@@ -1214,25 +1318,96 @@ def call_llm_with_failover(
         )
         raise EndpointsExhaustedError(
             f"所有端点均已熔断（连续失败 ≥{CIRCUIT_FAILURE_THRESHOLD} 次），"
-            f"请检查中转站配置后重试。\n{details}"
+            f"请检查上游端点配置（模型、API Key、服务状态）后重试。\n{details}"
         )
+
+    # 故障转移模式：禁用 L1 内部重试，每个端点仅 1 次请求机会
+    failover_runtime = RuntimeConfig(
+        request_timeout_seconds=runtime.request_timeout_seconds,
+        max_retries=0,
+        retry_backoff_seconds=runtime.retry_backoff_seconds,
+    )
 
     failures: List[str] = []
     for i, es in enumerate(available):
         effective_type = es.endpoint.api_type or stage.api_type
-        print(f"[failover] 尝试端点 '{es.name}' (api_type={effective_type})...")
+        effective_model = es.endpoint.model or stage.model
+        print(f"[failover] 尝试端点 '{es.name}' (model={effective_model}, api_type={effective_type})...")
         try:
-            result = call_llm(stage, es.endpoint, system_prompt, user_prompt, runtime)
+            result = call_llm(stage, es.endpoint, system_prompt, user_prompt, failover_runtime, extra_messages)
             es.record_success()
             return result
         except PipelineError as exc:
-            es.record_failure()
+            es.record_failure(error_msg=str(exc))
             failures.append(f"{es.name}: {exc}")
             next_i = i + 1
             if next_i < len(available):
                 print(f"[failover] 端点 '{es.name}' 失败，切换到 '{available[next_i].name}'")
 
     raise PipelineError("所有端点均调用失败：" + " | ".join(failures))
+
+
+# ── 自动续接 ──
+
+
+_CONTINUATION_MAX_ROUNDS = 5
+_CONTINUATION_END_MARKER = "<!-- END -->"
+
+
+def call_llm_with_continuation(
+    stage: StageConfig,
+    endpoint_states: List[EndpointState],
+    system_prompt: str,
+    user_prompt: str,
+    runtime: RuntimeConfig,
+) -> str:
+    """带自动续接的 LLM 调用。
+
+    当 system_prompt 中包含结束标记指令时，检测输出是否包含 <!-- END -->，
+    若缺失则自动发送「继续」进行多轮续接，最多 _CONTINUATION_MAX_ROUNDS 轮。
+    """
+    result = call_llm_with_failover(
+        stage, endpoint_states, system_prompt, user_prompt, runtime,
+    )
+
+    # 如果 system_prompt 未要求结束标记，直接返回（向后兼容）
+    if _CONTINUATION_END_MARKER not in system_prompt:
+        return result
+
+    # 检查是否完整
+    if _CONTINUATION_END_MARKER in result:
+        return result.replace(_CONTINUATION_END_MARKER, "").strip()
+
+    # 需要续接
+    accumulated_parts = [result]
+    extra_messages: List[Dict[str, str]] = []
+
+    for round_num in range(1, _CONTINUATION_MAX_ROUNDS + 1):
+        print(
+            f"[continuation] 输出未完整（未检测到结束标记），"
+            f"第 {round_num}/{_CONTINUATION_MAX_ROUNDS} 轮续接..."
+        )
+        extra_messages.append({"role": "assistant", "content": result})
+        extra_messages.append({"role": "user", "content": "继续"})
+
+        result = call_llm_with_failover(
+            stage, endpoint_states, system_prompt, user_prompt, runtime,
+            extra_messages=extra_messages,
+        )
+        accumulated_parts.append(result)
+
+        if _CONTINUATION_END_MARKER in result:
+            break
+
+    accumulated = "".join(accumulated_parts)
+
+    if _CONTINUATION_END_MARKER not in accumulated:
+        print(
+            f"[continuation] 警告：{_CONTINUATION_MAX_ROUNDS} 轮续接后"
+            f"仍未检测到结束标记，保存已有内容"
+        )
+
+    return accumulated.replace(_CONTINUATION_END_MARKER, "").strip()
 
 
 # ── 错误分类 ──
@@ -1430,7 +1605,7 @@ def _extract_single(
 ) -> str:
     """单次 LLM 调用，返回 Markdown 文本。"""
     user_prompt = f"请处理以下文件。文件名：{source_name}\n\n{text}"
-    raw = call_llm_with_failover(
+    raw = call_llm_with_continuation(
         stage=config.extract_stage,
         endpoint_states=endpoint_states,
         system_prompt=config.extract_stage.system_prompt,
@@ -1450,7 +1625,7 @@ def _extract_batch(
     for name, text in files:
         parts.append(f"---\n## 来源文件：{name}\n\n{text}")
     user_prompt = "请逐个处理以下文件。\n\n" + "\n\n".join(parts)
-    raw = call_llm_with_failover(
+    raw = call_llm_with_continuation(
         stage=config.extract_stage,
         endpoint_states=endpoint_states,
         system_prompt=config.extract_stage.system_prompt,
@@ -1482,7 +1657,6 @@ def _append_manifest(manifest_path: Path, names: List[str]) -> None:
 
 _TASK_MAX_RETRIES = 3          # L3 层每个任务的最大重试次数
 _TASK_RETRY_INTERVAL = 15      # 普通失败后等待秒数
-_CIRCUIT_WAIT_SECONDS = 70     # 熔断后等待秒数（> CIRCUIT_COOLDOWN_SECONDS=60）
 
 
 def _extract_with_retry(
@@ -1490,19 +1664,13 @@ def _extract_with_retry(
     label: str,
     max_retries: int = _TASK_MAX_RETRIES,
 ) -> str:
-    """L3 层重试包装：处理 PipelineError 和 EndpointsExhaustedError。"""
+    """L3 层重试包装：处理 PipelineError（EndpointsExhaustedError 直接上抛）。"""
     for attempt in range(1, max_retries + 2):  # +1 for initial attempt
         try:
             return call_fn()
         except EndpointsExhaustedError:
-            if attempt > max_retries:
-                raise
-            print(
-                f"[extract] {label}: 所有端点已熔断，"
-                f"等待 {_CIRCUIT_WAIT_SECONDS}s 后重试 "
-                f"({attempt}/{max_retries})..."
-            )
-            time.sleep(_CIRCUIT_WAIT_SECONDS)
+            # 所有端点已熔断，立即停止，不再重试
+            raise
         except PipelineError as exc:
             if attempt > max_retries:
                 raise
@@ -1528,7 +1696,8 @@ def run_extract_stage(
     extract_dir.mkdir(parents=True, exist_ok=True)
     manifest_path = extract_dir / "_manifest.txt"
 
-    endpoint_states = _create_endpoint_states(config, config.extract_stage)
+    log_dir = config.output_dir / "_logs"
+    endpoint_states = _create_endpoint_states(config, config.extract_stage, log_dir=log_dir)
     batch_cfg = config.batching.extract
 
     print(f"[extract] 共发现 {len(source_files)} 个 .txt 文件")
@@ -1603,117 +1772,188 @@ def run_extract_stage(
     # Normal 任务按大小排序装箱
     normal_tasks.sort(key=lambda t: t["size_kb"])
 
-    total_calls = len(chunk_tasks)  # 每个 chunk 一次调用
-    processed = 0
+    # ── Pass 4: 构建并发工作单元 ──
+    work_units: List[Dict[str, Any]] = []
 
     if batch_cfg.enabled and len(normal_tasks) > 1:
-        # 为 compute_batches 准备：使用 source_name + text 的简单字典
         batch_items = [
             {"source_file": t["source_name"], "content": t["text"]}
             for t in normal_tasks
         ]
         batches = compute_batches(batch_items, batch_cfg.max_files_per_batch, effective_limit)
-        total_calls += len(batches)
+        normal_map = {t["source_name"]: t for t in normal_tasks}
 
         print(
             f"[extract] 批处理已启用：{len(normal_tasks)} 个普通文件 → {len(batches)} 个批次, "
             f"{len(chunk_tasks)} 个超大文件拆块"
         )
 
-        # 建立 source_name → normal_task 映射
-        normal_map = {t["source_name"]: t for t in normal_tasks}
-
         for batch_idx, batch in enumerate(batches, start=1):
             batch_names = [item["source_file"] for item in batch]
-            processed += 1
-
             if len(batch) == 1:
-                # 单文件
                 name = batch_names[0]
                 t = normal_map[name]
-                print(f"[extract {processed}/{total_calls}] {name} (编码: {t['detected_encoding']})")
-                try:
-                    md = _extract_with_retry(
-                        lambda _n=name, _t=t["text"]: _extract_single(config, endpoint_states, _n, _t),
-                        label=name,
-                    )
-                    out_path = extract_dir / f"{safe_filename(name)}.md"
-                    out_path.write_text(md, encoding="utf-8")
-                    _append_manifest(manifest_path, [name])
-                    print(f"[extract] → {out_path.name}")
-                except (PipelineError, EndpointsExhaustedError) as exc:
-                    print(f"[extract] 失败（重试耗尽）: {name}: {exc}")
+                work_units.append({
+                    "type": "single",
+                    "name": name,
+                    "text": t["text"],
+                    "encoding": t["detected_encoding"],
+                })
             else:
-                # 多文件批次
-                batch_size_kb = sum(normal_map[n]["size_kb"] for n in batch_names)
-                print(
-                    f"[extract {processed}/{total_calls}] 批次 {batch_idx}: "
-                    f"{len(batch)} 个文件, {batch_size_kb:.1f}KB"
+                work_units.append({
+                    "type": "batch",
+                    "batch_idx": batch_idx,
+                    "names": batch_names,
+                    "files": [(n, normal_map[n]["text"]) for n in batch_names],
+                    "size_kb": sum(normal_map[n]["size_kb"] for n in batch_names),
+                })
+    else:
+        for t in normal_tasks:
+            work_units.append({
+                "type": "single",
+                "name": t["source_name"],
+                "text": t["text"],
+                "encoding": t["detected_encoding"],
+            })
+
+    # 超大文件拆块 → 按源文件分组，同一文件的块在同一线程内顺序处理
+    chunks_by_file: Dict[str, List[Dict[str, Any]]] = {}
+    for t in chunk_tasks:
+        chunks_by_file.setdefault(t["source_name"], []).append(t)
+    for cname, clist in chunks_by_file.items():
+        clist.sort(key=lambda c: c["chunk_index"])
+        work_units.append({
+            "type": "chunk_group",
+            "name": cname,
+            "chunks": clist,
+        })
+
+    total_units = len(work_units)
+
+    # ── 并发执行基础设施 ──
+    manifest_lock = threading.Lock()
+    stop_event = threading.Event()
+    progress_lock = threading.Lock()
+    done_count = [0]
+
+    def _process_extract_unit(unit: Dict[str, Any]) -> None:
+        """处理单个 extract 工作单元（线程安全）。"""
+        if stop_event.is_set():
+            return
+
+        with progress_lock:
+            done_count[0] += 1
+            seq = done_count[0]
+
+        try:
+            if unit["type"] == "single":
+                name = unit["name"]
+                print(f"[extract {seq}/{total_units}] {name} (编码: {unit['encoding']})")
+                md = _extract_with_retry(
+                    lambda _n=name, _t=unit["text"]: _extract_single(config, endpoint_states, _n, _t),
+                    label=name,
                 )
-                files_for_prompt = [(n, normal_map[n]["text"]) for n in batch_names]
+                out_path = extract_dir / f"{safe_filename(name)}.md"
+                out_path.write_text(md, encoding="utf-8")
+                with manifest_lock:
+                    _append_manifest(manifest_path, [name])
+                print(f"[extract] → {out_path.name}")
+
+            elif unit["type"] == "batch":
+                batch_idx = unit["batch_idx"]
+                batch_names = unit["names"]
+                files_for_prompt = unit["files"]
+                print(
+                    f"[extract {seq}/{total_units}] 批次 {batch_idx}: "
+                    f"{len(batch_names)} 个文件, {unit['size_kb']:.1f}KB"
+                )
                 try:
                     md = _extract_with_retry(
                         lambda _f=files_for_prompt: _extract_batch(config, endpoint_states, _f),
                         label=f"批次 {batch_idx}",
                     )
-                    out_path = extract_dir / f"batch_{batch_idx:03d}.md"
+                    out_path = extract_dir / _batch_output_name(batch_names)
                     out_path.write_text(md, encoding="utf-8")
-                    _append_manifest(manifest_path, batch_names)
+                    with manifest_lock:
+                        _append_manifest(manifest_path, batch_names)
                     print(f"[extract] → {out_path.name}")
-                except (PipelineError, EndpointsExhaustedError) as exc:
-                    # 批量失败（重试耗尽） → 逐文件回退
+                except EndpointsExhaustedError:
+                    raise
+                except PipelineError as exc:
+                    # 批量失败 → 逐文件回退
                     print(f"[extract] 批次失败（重试耗尽）: {exc}，逐文件回退")
-                    for fi, name in enumerate(batch_names, 1):
-                        t = normal_map[name]
-                        print(f"[extract] 回退处理: {name} ({fi}/{len(batch_names)})")
+                    for fi, (fname, ftext) in enumerate(files_for_prompt, 1):
+                        if stop_event.is_set():
+                            return
+                        print(f"[extract] 回退处理: {fname} ({fi}/{len(files_for_prompt)})")
                         try:
                             md = _extract_with_retry(
-                                lambda _n=name, _t=t["text"]: _extract_single(config, endpoint_states, _n, _t),
-                                label=name,
+                                lambda _n=fname, _t=ftext: _extract_single(config, endpoint_states, _n, _t),
+                                label=fname,
                             )
-                            out_path = extract_dir / f"{safe_filename(name)}.md"
+                            out_path = extract_dir / f"{safe_filename(fname)}.md"
                             out_path.write_text(md, encoding="utf-8")
-                            _append_manifest(manifest_path, [name])
-                        except (PipelineError, EndpointsExhaustedError) as single_exc:
-                            print(f"[extract] 单文件也失败（重试耗尽）: {name}: {single_exc}")
-    else:
-        # 不启用批处理 → 逐文件处理
-        total_calls += len(normal_tasks)
-        for t in normal_tasks:
-            processed += 1
-            name = t["source_name"]
-            print(f"[extract {processed}/{total_calls}] {name} (编码: {t['detected_encoding']})")
-            try:
-                md = _extract_with_retry(
-                    lambda _n=name, _t=t["text"]: _extract_single(config, endpoint_states, _n, _t),
-                    label=name,
-                )
-                out_path = extract_dir / f"{safe_filename(name)}.md"
-                out_path.write_text(md, encoding="utf-8")
-                _append_manifest(manifest_path, [name])
-            except (PipelineError, EndpointsExhaustedError) as exc:
-                print(f"[extract] 失败（重试耗尽）: {name}: {exc}")
+                            with manifest_lock:
+                                _append_manifest(manifest_path, [fname])
+                        except EndpointsExhaustedError:
+                            raise
+                        except PipelineError as single_exc:
+                            print(f"[extract] 单文件也失败（重试耗尽）: {fname}: {single_exc}")
 
-    # 处理超大文件拆块
-    for t in chunk_tasks:
-        processed += 1
-        name = t["source_name"]
-        ci = t["chunk_index"]
-        ct = t["chunk_total"]
-        print(f"[extract {processed}/{total_calls}] {name} 块 {ci}/{ct}")
-        try:
-            chunk_label = f"{name} (块 {ci}/{ct})"
-            md = _extract_with_retry(
-                lambda _l=chunk_label, _t=t["text"]: _extract_single(config, endpoint_states, _l, _t),
-                label=chunk_label,
-            )
-            out_path = extract_dir / f"{safe_filename(name)}_part{ci}.md"
-            out_path.write_text(md, encoding="utf-8")
-            # 只在最后一块处理完后才添加到 manifest
-            if ci == ct:
-                _append_manifest(manifest_path, [name])
-        except (PipelineError, EndpointsExhaustedError) as exc:
-            print(f"[extract] 失败（重试耗尽）: {name} 块 {ci}: {exc}")
+            elif unit["type"] == "chunk_group":
+                name = unit["name"]
+                chunks = unit["chunks"]
+                for t in chunks:
+                    if stop_event.is_set():
+                        return
+                    ci = t["chunk_index"]
+                    ct = t["chunk_total"]
+                    print(f"[extract {seq}/{total_units}] {name} 块 {ci}/{ct}")
+                    chunk_label = f"{name} (块 {ci}/{ct})"
+                    md = _extract_with_retry(
+                        lambda _l=chunk_label, _t=t["text"]: _extract_single(config, endpoint_states, _l, _t),
+                        label=chunk_label,
+                    )
+                    out_path = extract_dir / f"{safe_filename(name)}_part{ci}.md"
+                    out_path.write_text(md, encoding="utf-8")
+                # 所有块处理完后才写 manifest
+                with manifest_lock:
+                    _append_manifest(manifest_path, [name])
+
+        except EndpointsExhaustedError:
+            stop_event.set()
+            raise
+        except PipelineError as exc:
+            print(f"[extract] 失败（重试耗尽）: {exc}")
+
+    # ── 执行（串行 or 并发） ──
+    max_workers = config.concurrency.max_workers
+
+    if max_workers <= 1:
+        for unit in work_units:
+            _process_extract_unit(unit)
+            if stop_event.is_set():
+                break
+    else:
+        print(f"[extract] 并发模式：max_workers={max_workers}")
+        with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="extract") as executor:
+            futures = {executor.submit(_process_extract_unit, u): u for u in work_units}
+            try:
+                for future in as_completed(futures):
+                    if stop_event.is_set():
+                        for pending_f in futures:
+                            pending_f.cancel()
+                        break
+                    try:
+                        future.result()
+                    except EndpointsExhaustedError:
+                        for pending_f in futures:
+                            pending_f.cancel()
+                        break
+            except KeyboardInterrupt:
+                print("\n[extract] 用户中断，取消剩余任务...")
+                executor.shutdown(wait=False, cancel_futures=True)
+                raise
 
     print(f"[extract] 阶段完成，输出目录：{extract_dir}")
     return extract_dir
@@ -1869,7 +2109,8 @@ def run_synthesize_stage(
 ) -> None:
     """Synthesize 阶段：按分类标签归组 → 标签合并 → 逐分类 LLM 合并去重。"""
 
-    endpoint_states = _create_endpoint_states(config, config.synthesize_stage)
+    log_dir = config.output_dir / "_logs"
+    endpoint_states = _create_endpoint_states(config, config.synthesize_stage, log_dir=log_dir)
     intermediate_dir = config.output_dir / "_intermediate"
     intermediate_dir.mkdir(parents=True, exist_ok=True)
     topics_dir = config.output_dir / "topics"
@@ -1900,6 +2141,20 @@ def run_synthesize_stage(
                     return
             except (json.JSONDecodeError, KeyError):
                 pass
+
+    # ── 逐主题断点续传 manifest ──
+    topic_done_path = intermediate_dir / "synthesize_topic_done.txt"
+
+    # 指纹变更 → 清除逐主题进度（extract 内容已变，旧主题结果无效）
+    if fingerprint_path.is_file():
+        stored_fp = fingerprint_path.read_text(encoding="utf-8").strip()
+        if stored_fp != current_fingerprint and topic_done_path.is_file():
+            print("[synthesize] extract 内容已变更，清除逐主题进度")
+            topic_done_path.unlink()
+
+    # 提前写入指纹，使逐主题 manifest 与当前指纹关联
+    fingerprint_path.write_text(current_fingerprint, encoding="utf-8")
+    done_topics = _read_manifest(topic_done_path)
 
     # ── Phase 1: 按分类标签归组（纯代码，零信息损失） ──
     print("[synthesize] Phase 1: 按分类标签归组知识单元...")
@@ -1938,7 +2193,16 @@ def run_synthesize_stage(
     topic_files: List[str] = []
     total = len(topic_names)
 
-    for i, topic_name in enumerate(topic_names, 1):
+    # ── 并发执行基础设施 ──
+    manifest_lock = threading.Lock()
+    stop_event = threading.Event()
+    topic_files_lock = threading.Lock()
+
+    def _process_topic(i: int, topic_name: str) -> str | None:
+        """处理单个主题（线程安全），返回输出文件名或 None。"""
+        if stop_event.is_set():
+            return None
+
         units = merged_buckets[topic_name]
         combined_text = "\n\n---\n\n".join(units)
         combined_kb = len(combined_text.encode("utf-8")) / 1024.0
@@ -1946,13 +2210,19 @@ def run_synthesize_stage(
         filename = f"{i:02d}_{safe_filename(topic_name)}.md"
         topic_path = topics_dir / filename
 
+        # 断点续传：跳过已完成的主题
+        if topic_name in done_topics and topic_path.is_file():
+            print(f"[synthesize {i}/{total}] {topic_name} (已处理，跳过)")
+            return filename
+
         print(f"[synthesize {i}/{total}] {topic_name} ({len(units)} 条, {combined_kb:.1f}KB)")
 
         if len(units) == 1:
             print(f"[synthesize] → 仅 1 条，直接写入: {filename}")
             topic_path.write_text(units[0], encoding="utf-8")
-            topic_files.append(filename)
-            continue
+            with manifest_lock:
+                _append_manifest(topic_done_path, [topic_name])
+            return filename
 
         user_prompt = (
             f"以下是关于【{topic_name}】这一主题的 {len(units)} 条知识单元，"
@@ -1960,9 +2230,9 @@ def run_synthesize_stage(
             + combined_text
         )
 
-        if combined_kb <= effective_limit:
-            try:
-                raw = call_llm_with_failover(
+        try:
+            if combined_kb <= effective_limit:
+                raw = call_llm_with_continuation(
                     stage=config.synthesize_stage,
                     endpoint_states=endpoint_states,
                     system_prompt=synthesize_system_prompt,
@@ -1973,52 +2243,102 @@ def run_synthesize_stage(
                 topic_path.write_text(result, encoding="utf-8")
                 result_kb = len(result.encode("utf-8")) / 1024.0
                 print(f"[synthesize] → {filename} ({result_kb:.1f}KB)")
-            except PipelineError as exc:
-                print(f"[synthesize] 失败: {topic_name}: {exc}")
-                topic_path.write_text(combined_text, encoding="utf-8")
-                print(f"[synthesize] → 降级为原文拼接: {filename}")
-        else:
-            print(
-                f"[synthesize] 主题过大 ({combined_kb:.1f}KB > {effective_limit}KB)，分批处理"
-            )
-            sub_batches = compute_batches(
-                [{"text": u} for u in units],
-                999,
-                effective_limit,
-            )
-
-            sub_results: List[str] = []
-            for si, sub_batch in enumerate(sub_batches, 1):
-                sub_text = "\n\n---\n\n".join(item["text"] for item in sub_batch)
-                sub_kb = len(sub_text.encode("utf-8")) / 1024.0
-                print(f"[synthesize]   子批 {si}/{len(sub_batches)}: {sub_kb:.1f}KB")
-
-                sub_prompt = (
-                    f"以下是关于【{topic_name}】这一主题的部分知识单元"
-                    f"（第 {si}/{len(sub_batches)} 批）。"
-                    f"请合并整理，保留所有独特内容。\n\n"
-                    + sub_text
+            else:
+                print(
+                    f"[synthesize] 主题过大 ({combined_kb:.1f}KB > {effective_limit}KB)，分批处理"
+                )
+                sub_batches = compute_batches(
+                    [{"text": u} for u in units],
+                    999,
+                    effective_limit,
                 )
 
-                try:
-                    raw = call_llm_with_failover(
-                        stage=config.synthesize_stage,
-                        endpoint_states=endpoint_states,
-                        system_prompt=synthesize_system_prompt,
-                        user_prompt=sub_prompt,
-                        runtime=config.runtime,
+                sub_results: List[str] = []
+                for si, sub_batch in enumerate(sub_batches, 1):
+                    if stop_event.is_set():
+                        return None
+                    sub_text = "\n\n---\n\n".join(item["text"] for item in sub_batch)
+                    sub_kb = len(sub_text.encode("utf-8")) / 1024.0
+                    print(f"[synthesize]   子批 {si}/{len(sub_batches)}: {sub_kb:.1f}KB")
+
+                    sub_prompt = (
+                        f"以下是关于【{topic_name}】这一主题的部分知识单元"
+                        f"（第 {si}/{len(sub_batches)} 批）。"
+                        f"请合并整理，保留所有独特内容。\n\n"
+                        + sub_text
                     )
-                    sub_results.append(strip_code_fences(raw))
-                except PipelineError as exc:
-                    print(f"[synthesize]   子批 {si} 失败: {exc}，保留原文")
-                    sub_results.append(sub_text)
 
-            final_text = "\n\n---\n\n".join(sub_results)
-            topic_path.write_text(final_text, encoding="utf-8")
-            final_kb = len(final_text.encode("utf-8")) / 1024.0
-            print(f"[synthesize] → {filename} ({final_kb:.1f}KB)")
+                    try:
+                        raw = call_llm_with_continuation(
+                            stage=config.synthesize_stage,
+                            endpoint_states=endpoint_states,
+                            system_prompt=synthesize_system_prompt,
+                            user_prompt=sub_prompt,
+                            runtime=config.runtime,
+                        )
+                        sub_results.append(strip_code_fences(raw))
+                    except PipelineError as exc:
+                        if isinstance(exc, EndpointsExhaustedError):
+                            raise
+                        print(f"[synthesize]   子批 {si} 失败: {exc}，保留原文")
+                        sub_results.append(sub_text)
 
-        topic_files.append(filename)
+                final_text = "\n\n---\n\n".join(sub_results)
+                topic_path.write_text(final_text, encoding="utf-8")
+                final_kb = len(final_text.encode("utf-8")) / 1024.0
+                print(f"[synthesize] → {filename} ({final_kb:.1f}KB)")
+
+        except EndpointsExhaustedError:
+            stop_event.set()
+            raise
+        except PipelineError as exc:
+            print(f"[synthesize] 失败: {topic_name}: {exc}")
+            topic_path.write_text(combined_text, encoding="utf-8")
+            print(f"[synthesize] → 降级为原文拼接: {filename}")
+
+        with manifest_lock:
+            _append_manifest(topic_done_path, [topic_name])
+        return filename
+
+    # ── 执行（串行 or 并发） ──
+    max_workers = config.concurrency.max_workers
+
+    if max_workers <= 1:
+        for i, topic_name in enumerate(topic_names, 1):
+            result = _process_topic(i, topic_name)
+            if result:
+                topic_files.append(result)
+            if stop_event.is_set():
+                break
+    else:
+        print(f"[synthesize] 并发模式：max_workers={max_workers}")
+        with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="synth") as executor:
+            futures = {}
+            for i, topic_name in enumerate(topic_names, 1):
+                f = executor.submit(_process_topic, i, topic_name)
+                futures[f] = topic_name
+            try:
+                for future in as_completed(futures):
+                    if stop_event.is_set():
+                        for pending_f in futures:
+                            pending_f.cancel()
+                        break
+                    try:
+                        result = future.result()
+                        if result:
+                            with topic_files_lock:
+                                topic_files.append(result)
+                    except EndpointsExhaustedError:
+                        for pending_f in futures:
+                            pending_f.cancel()
+                        break
+            except KeyboardInterrupt:
+                print("\n[synthesize] 用户中断，取消剩余任务...")
+                executor.shutdown(wait=False, cancel_futures=True)
+                raise
+
+    # 排序确保文件列表顺序一致
+    topic_files.sort()
 
     # ── 写入缓存 manifest ──
     manifest_payload = {
@@ -2172,6 +2492,8 @@ def run_pipeline(config: PipelineConfig, only_stage: str) -> None:
     )
     print(f"[pipeline] extract 端点: {_fmt_endpoints(config.extract_stage)}")
     print(f"[pipeline] synthesize 端点: {_fmt_endpoints(config.synthesize_stage)}")
+    workers = config.concurrency.max_workers
+    print(f"[pipeline] 并发: max_workers={workers}" + (" (串行模式)" if workers <= 1 else ""))
 
     extract_dir: Path | None = None
 
