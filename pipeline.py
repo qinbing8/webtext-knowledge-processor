@@ -2329,6 +2329,8 @@ def run_synthesize_stage(
     # ── 并发执行基础设施 ──
     manifest_lock = threading.Lock()
     stop_event = threading.Event()
+    consecutive_all_fail = [0]           # 连续全端点失败轮次（跨线程共享）
+    ALL_FAIL_THRESHOLD = 3              # 连续 N 轮 → 升级为熔断终止
     topic_files_lock = threading.Lock()
     synth_worker_id_counter = [0]
     synth_worker_id_lock = threading.Lock()
@@ -2403,6 +2405,8 @@ def run_synthesize_stage(
                 topic_path.write_text(result, encoding="utf-8")
                 result_kb = len(result.encode("utf-8")) / 1024.0
                 print(f"[synthesize{s_tag}] → {filename} ({result_kb:.1f}KB)")
+                with manifest_lock:
+                    consecutive_all_fail[0] = 0
             else:
                 print(
                     f"[synthesize{s_tag}] 主题过大 ({combined_kb:.1f}KB > {effective_limit}KB)，分批处理"
@@ -2438,9 +2442,19 @@ def run_synthesize_stage(
                             runtime=config.runtime,
                         )
                         sub_results.append(strip_code_fences(raw))
+                        with manifest_lock:
+                            consecutive_all_fail[0] = 0
                     except PipelineError as exc:
                         if isinstance(exc, EndpointsExhaustedError):
                             raise
+                        with manifest_lock:
+                            consecutive_all_fail[0] += 1
+                            if consecutive_all_fail[0] >= ALL_FAIL_THRESHOLD:
+                                print(f"[synthesize{s_tag}] 连续 {consecutive_all_fail[0]} 轮全端点失败，触发熔断终止")
+                                stop_event.set()
+                                raise EndpointsExhaustedError(
+                                    f"连续 {consecutive_all_fail[0]} 轮全端点调用失败，终止处理"
+                                ) from exc
                         print(f"[synthesize{s_tag}]   子批 {si} 失败: {exc}，保留原文")
                         sub_results.append(sub_text)
 
@@ -2457,6 +2471,14 @@ def run_synthesize_stage(
             raise
         except PipelineError as exc:
             synth_clog.record(worker=worker_name, unit=topic_name, status="error", duration_s=time.time() - t0, error=str(exc))
+            with manifest_lock:
+                consecutive_all_fail[0] += 1
+                if consecutive_all_fail[0] >= ALL_FAIL_THRESHOLD:
+                    print(f"[synthesize{s_tag}] 连续 {consecutive_all_fail[0]} 轮全端点失败，触发熔断终止")
+                    stop_event.set()
+                    raise EndpointsExhaustedError(
+                        f"连续 {consecutive_all_fail[0]} 轮全端点调用失败，终止处理"
+                    ) from exc
             print(f"[synthesize{s_tag}] 失败: {topic_name}: {exc}")
             topic_path.write_text(combined_text, encoding="utf-8")
             print(f"[synthesize{s_tag}] → 降级为原文拼接: {filename}")
