@@ -1577,6 +1577,47 @@ def _compute_unit_fingerprints(units: List[str]) -> List[str]:
     return [hashlib.sha256(u.encode("utf-8")).hexdigest()[:16] for u in units]
 
 
+def _find_best_cached_match(
+    cached_topic_fps: dict[str, dict],
+    current_unit_fps: List[str],
+    min_overlap: float = 0.5,
+) -> tuple[str | None, dict]:
+    """基于 unit_fps 集合重叠度查找最佳缓存匹配。
+
+    返回 (cached_topic_name, cached_entry)。
+    如果没有任何缓存主题的重叠度 >= min_overlap，返回 (None, {})。
+    """
+    if not current_unit_fps:
+        return None, {}
+
+    current_set = set(current_unit_fps)
+    best_name: str | None = None
+    best_entry: dict = {}
+    best_overlap: float = 0.0
+
+    for name, entry in cached_topic_fps.items():
+        if not isinstance(entry, dict):
+            continue
+        cached_fps = entry.get("unit_fps", [])
+        if not cached_fps:
+            continue
+        cached_set = set(cached_fps)
+        intersection = current_set & cached_set
+        if not intersection:
+            continue
+        # 以当前主题和缓存主题中较大的集合为分母，确保双向对称性
+        denominator = max(len(current_set), len(cached_set))
+        overlap = len(intersection) / denominator
+        if overlap > best_overlap:
+            best_overlap = overlap
+            best_name = name
+            best_entry = entry
+
+    if best_overlap >= min_overlap:
+        return best_name, best_entry
+    return None, {}
+
+
 def _save_topic_fingerprints(path: Path, merge_sig: str, fps: dict) -> None:
     """持久化 per-topic 指纹缓存。"""
     dump_json(path, {"merge_sig": merge_sig, "topics": fps})
@@ -2504,15 +2545,57 @@ def run_synthesize_stage(
         t0 = time.time()
         worker_name = threading.current_thread().name
 
-        # 增量缓存：主题输入未变则跳过
+        # ── 增量缓存：基于内容匹配（而非主题名），避免 LLM 改名导致缓存失效 ──
         current_fp = _compute_topic_fingerprint(units)
         current_unit_fps = _compute_unit_fingerprints(units)
-        cached_entry = cached_topic_fps.get(topic_name, {})
-        cached_fp = cached_entry.get("fingerprint", "") if isinstance(cached_entry, dict) else cached_entry
+
+        # 线程安全地查找缓存匹配（防止并发时多个主题争抢同一缓存条目）
+        with manifest_lock:
+            # 1) 先尝试精确名称匹配（快速路径）
+            cached_entry = cached_topic_fps.get(topic_name, {})
+            matched_cache_name = topic_name if cached_entry else None
+
+            # 2) 名称未命中 → 基于 unit_fps 重叠度查找
+            if not cached_entry:
+                matched_cache_name, cached_entry = _find_best_cached_match(
+                    cached_topic_fps, current_unit_fps,
+                )
+                if matched_cache_name:
+                    # 立即从旧名称移除，防止其他线程重复匹配
+                    cached_topic_fps.pop(matched_cache_name)
+                    # 暂存到新名称下（后续路径会更新完整信息）
+                    cached_topic_fps[topic_name] = cached_entry
+                    print(
+                        f"[synthesize{s_tag}] 内容匹配: "
+                        f"'{topic_name}' ← 缓存 '{matched_cache_name}'"
+                    )
+
+        cached_fp = cached_entry.get("fingerprint", "") if isinstance(cached_entry, dict) else (cached_entry if isinstance(cached_entry, str) else "")
         cached_unit_fps = cached_entry.get("unit_fps", []) if isinstance(cached_entry, dict) else []
+        cached_output_file = cached_entry.get("output_file", "") if isinstance(cached_entry, dict) else ""
+
+        # 解析已有输出文件路径（当主题名变更时，从缓存的 output_file 定位旧文件）
+        existing_output_path = topic_path  # 默认：当前名称对应的路径
+        if cached_output_file and not topic_path.is_file():
+            old_path = topics_dir / cached_output_file
+            if old_path.is_file():
+                existing_output_path = old_path
 
         if (cached_fp == current_fp and
-                topic_path.is_file()):
+                existing_output_path.is_file()):
+            # 如果匹配的缓存来自不同名称，将旧文件重命名为新名称
+            if existing_output_path != topic_path:
+                existing_output_path.rename(topic_path)
+                print(f"[synthesize{s_tag}] 重命名: {existing_output_path.name} → {filename}")
+            # 清理旧缓存条目，写入新名称条目
+            if matched_cache_name and matched_cache_name != topic_name:
+                with manifest_lock:
+                    cached_topic_fps[topic_name] = {
+                        "fingerprint": current_fp,
+                        "unit_fps": current_unit_fps,
+                        "output_file": filename,
+                    }
+                    _save_topic_fingerprints(topic_fp_path, merge_sig, cached_topic_fps)
             print(f"[synthesize{s_tag} {i}/{total}] {topic_name} (内容未变，跳过)")
             synth_clog.record(worker=worker_name, unit=topic_name, status="skip", duration_s=0.0)
             return filename
@@ -2525,7 +2608,7 @@ def run_synthesize_stage(
 
         if (not full_resync
                 and cached_unit_fps  # 有 unit_fps 缓存
-                and topic_path.is_file()  # 输出文件存在
+                and existing_output_path.is_file()  # 输出文件存在
                 and not deleted_unit_fps  # 无删除
                 and new_unit_fps  # 有新增
                 and len(new_unit_fps) <= len(current_unit_fps) * 0.5):  # 新增 ≤ 50%
@@ -2553,6 +2636,9 @@ def run_synthesize_stage(
                         runtime=config.runtime,
                     )
                     delta_result = strip_code_fences(raw)
+                    # 如果旧文件名不同，先重命名
+                    if existing_output_path != topic_path and existing_output_path.is_file():
+                        existing_output_path.rename(topic_path)
                     # 追加到已有输出文件末尾
                     existing_text = topic_path.read_text(encoding="utf-8")
                     merged_text = existing_text + "\n\n---\n\n" + delta_result
@@ -2561,7 +2647,7 @@ def run_synthesize_stage(
                     print(f"[synthesize{s_tag}] → Delta 追加: {filename} ({merged_kb:.1f}KB)")
                     with manifest_lock:
                         consecutive_all_fail[0] = 0
-                        cached_topic_fps[topic_name] = {"fingerprint": current_fp, "unit_fps": current_unit_fps}
+                        cached_topic_fps[topic_name] = {"fingerprint": current_fp, "unit_fps": current_unit_fps, "output_file": filename}
                         _save_topic_fingerprints(topic_fp_path, merge_sig, cached_topic_fps)
                     synth_clog.record(worker=worker_name, unit=topic_name, status="ok", duration_s=time.time() - t0)
                     return filename
@@ -2576,7 +2662,7 @@ def run_synthesize_stage(
             print(f"[synthesize{s_tag}] → 仅 1 条，直接写入: {filename}")
             topic_path.write_text(units[0], encoding="utf-8")
             with manifest_lock:
-                cached_topic_fps[topic_name] = {"fingerprint": current_fp, "unit_fps": current_unit_fps}
+                cached_topic_fps[topic_name] = {"fingerprint": current_fp, "unit_fps": current_unit_fps, "output_file": filename}
                 _save_topic_fingerprints(topic_fp_path, merge_sig, cached_topic_fps)
             synth_clog.record(worker=worker_name, unit=topic_name, status="ok", duration_s=time.time() - t0)
             return filename
@@ -2688,7 +2774,7 @@ def run_synthesize_stage(
             print(f"[synthesize{s_tag}] → 降级为原文拼接: {filename}")
 
         with manifest_lock:
-            cached_topic_fps[topic_name] = {"fingerprint": current_fp, "unit_fps": current_unit_fps}
+            cached_topic_fps[topic_name] = {"fingerprint": current_fp, "unit_fps": current_unit_fps, "output_file": filename}
             _save_topic_fingerprints(topic_fp_path, merge_sig, cached_topic_fps)
         return filename
 
