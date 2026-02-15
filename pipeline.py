@@ -192,11 +192,31 @@ class BatchingConfig:
     synthesize: SynthesizeBatchingConfig = field(default_factory=SynthesizeBatchingConfig)
 
 
+@dataclass
+class KnowledgeUnit:
+    """单条知识单元的结构化表示。"""
+    tag: str           # 分类标签（如"金三章"）
+    priority: int      # 0=P0, 1=P1, 2=P2, 3=无标注
+    title: str         # 知识点标题
+    body: str          # 完整文本（含 ## 标题行）
+    fingerprint: str   # 内容指纹（sha256[:16]）
+
+
+@dataclass(frozen=True)
+class SimilarityConfig:
+    """相似度扫描配置。"""
+    threshold: float = 0.70
+    ngram_size: int = 3
+    llm_batch_size: int = 8
+    max_file_size_kb: int = 100
+
+
 @dataclass(frozen=True)
 class SynthesizeMergeConfig:
     target_categories: int = 15
     use_llm: bool = True
     mapping: Dict[str, List[str]] = field(default_factory=dict)
+    similarity: SimilarityConfig = field(default_factory=SimilarityConfig)
 
 
 @dataclass(frozen=True)
@@ -315,10 +335,20 @@ def load_config(config_path: Path) -> PipelineConfig:
         if isinstance(topics, list):
             grouping_mapping[str(cat_name)] = [str(t) for t in topics]
 
+    # ── 解析 synthesize.similarity 配置 ──
+    similarity_raw = synthesize_raw.get("similarity", {}) or {}
+    similarity_config = SimilarityConfig(
+        threshold=float(similarity_raw.get("threshold", 0.70)),
+        ngram_size=int(similarity_raw.get("ngram_size", 3)),
+        llm_batch_size=int(similarity_raw.get("llm_batch_size", 8)),
+        max_file_size_kb=int(similarity_raw.get("max_file_size_kb", 100)),
+    )
+
     merge_config = SynthesizeMergeConfig(
         target_categories=int(grouping_raw.get("target_categories", 15)),
         use_llm=bool(grouping_raw.get("use_llm", True)),
         mapping=grouping_mapping,
+        similarity=similarity_config,
     )
 
     # ── 解析 concurrency 配置 ──
@@ -1151,17 +1181,17 @@ def call_claude(
     extra_messages: List[Dict[str, str]] | None = None,
 ) -> str:
     messages = [
-        {"role": "user", "content": [{"type": "text", "text": user_prompt}]},
+        {"role": "user", "content": user_prompt},
     ]
     if extra_messages:
         for em in extra_messages:
             messages.append({
                 "role": em["role"],
-                "content": [{"type": "text", "text": em["content"]}],
+                "content": em["content"],
             })
     payload = {
         "model": model,
-        "system": [{"type": "text", "text": system_prompt}],
+        "system": system_prompt,
         "max_tokens": 32768,
         "stream": True,
         "messages": messages,
@@ -2362,10 +2392,13 @@ def _repair_json(text: str) -> Any:
     raise PipelineError(f"无法解析 JSON：{text[:300]}")
 
 
-def group_by_category(extract_dir: Path) -> Dict[str, List[str]]:
-    """读取 extract 目录所有 .md，按 ## [分类标签][Px] 标签归组知识单元。
+def group_by_category(extract_dir: Path) -> tuple[
+    Dict[str, List[KnowledgeUnit]],  # tag → units
+    List[KnowledgeUnit],             # 全量 units 列表
+]:
+    """读取 extract 目录所有 .md，按 ## [分类标签][Px] 标签归组为结构化知识单元。
 
-    返回 { 分类名: [知识单元完整文本, ...] }。
+    返回 (tag_buckets, all_units)。
     未匹配标签格式的 ## 单元归入 "未分类"。
     """
     if not extract_dir.is_dir():
@@ -2378,27 +2411,441 @@ def group_by_category(extract_dir: Path) -> Dict[str, List[str]]:
     if not md_files:
         raise PipelineError(f"extract 目录中无 .md 文件：{extract_dir}")
 
-    tag_re = re.compile(r'^##\s*\[([^\]]+)\]\s*\[P[012]\]\s*')
+    # 同时捕获标签、优先级、标题
+    tag_re = re.compile(r'^##\s*\[([^\]]+)\]\s*\[P([012])\]\s*(.*)')
 
-    buckets: Dict[str, List[str]] = {}
+    buckets: Dict[str, List[KnowledgeUnit]] = {}
+    all_units: List[KnowledgeUnit] = []
 
     for md_file in md_files:
         text = md_file.read_text(encoding="utf-8")
         # 按 ## (非 ###) 边界拆分知识单元
         units = re.split(r'\n(?=## (?!#))', text)
 
-        for unit in units:
-            unit = unit.strip()
-            if not unit or not unit.startswith("## "):
-                # 跳过文件级标题(#)、前言、分隔线等非知识单元内容
+        for unit_text in units:
+            unit_text = unit_text.strip()
+            if not unit_text or not unit_text.startswith("## "):
                 continue
 
-            first_line = unit.split("\n", 1)[0]
+            first_line = unit_text.split("\n", 1)[0]
             match = tag_re.match(first_line)
-            category = match.group(1).strip() if match else "未分类"
-            buckets.setdefault(category, []).append(unit)
+            if match:
+                tag = match.group(1).strip()
+                priority = int(match.group(2))
+                title = match.group(3).strip()
+            else:
+                tag = "未分类"
+                priority = _extract_priority(first_line)
+                title = re.sub(r'^##\s*(\[[^\]]*\]\s*)*', '', first_line).strip()
 
-    return buckets
+            fp = hashlib.sha256(unit_text.encode("utf-8")).hexdigest()[:16]
+            ku = KnowledgeUnit(
+                tag=tag, priority=priority, title=title,
+                body=unit_text, fingerprint=fp,
+            )
+            buckets.setdefault(tag, []).append(ku)
+            all_units.append(ku)
+
+    return buckets, all_units
+
+
+def apply_topic_mapping(
+    tag_buckets: Dict[str, List[KnowledgeUnit]],
+    mapping: Dict[str, List[str]],
+) -> tuple[Dict[str, List[KnowledgeUnit]], List[str]]:
+    """按 mapping 将标签归入主题，未映射标签归入'未分类'。
+
+    返回 (topic_buckets, unmapped_tags)。
+    每个主题内按优先级排序：P0 → P1 → P2。
+    """
+    tag_to_topic: Dict[str, str] = {}
+    for topic_name, tags in mapping.items():
+        for tag in tags:
+            tag = tag.strip()
+            if tag and tag not in tag_to_topic:
+                tag_to_topic[tag] = topic_name
+
+    topic_buckets: Dict[str, List[KnowledgeUnit]] = {}
+    unmapped_tags: List[str] = []
+
+    for tag_name, units in tag_buckets.items():
+        topic = tag_to_topic.get(tag_name)
+        if topic is None:
+            unmapped_tags.append(tag_name)
+            topic = "未分类"
+        topic_buckets.setdefault(topic, []).extend(units)
+
+    # 每个主题内按优先级排序
+    for topic_name in topic_buckets:
+        topic_buckets[topic_name].sort(key=lambda u: u.priority)
+
+    return topic_buckets, unmapped_tags
+
+
+def ngram_jaccard(text_a: str, text_b: str, n: int = 3) -> float:
+    """计算两段文本的字符级 n-gram Jaccard 相似度。"""
+    def ngrams(text: str, n: int) -> set:
+        cleaned = re.sub(r'[#*\-|>\[\](){}]', '', text)
+        cleaned = re.sub(r'\s+', '', cleaned)
+        if len(cleaned) < n:
+            return set()
+        return set(cleaned[i:i+n] for i in range(len(cleaned) - n + 1))
+    a, b = ngrams(text_a, n), ngrams(text_b, n)
+    if not a or not b:
+        return 0.0
+    return len(a & b) / len(a | b)
+
+
+def _compute_ngrams(text: str, n: int) -> frozenset:
+    """预计算文本的字符级 n-gram 集合。"""
+    cleaned = re.sub(r'[#*\-|>\[\](){}]', '', text)
+    cleaned = re.sub(r'\s+', '', cleaned)
+    if len(cleaned) < n:
+        return frozenset()
+    return frozenset(cleaned[i:i+n] for i in range(len(cleaned) - n + 1))
+
+
+def _jaccard_from_sets(a: frozenset, b: frozenset) -> float:
+    """从预计算的 n-gram 集合计算 Jaccard 相似度。"""
+    if not a or not b:
+        return 0.0
+    return len(a & b) / len(a | b)
+
+
+def scan_similarity(
+    topic_units: Dict[str, List[KnowledgeUnit]],
+    all_units: List[KnowledgeUnit],
+    cached_fps: set,
+    threshold: float,
+    ngram_size: int,
+) -> tuple[List[tuple[KnowledgeUnit, KnowledgeUnit, float]], List[tuple[KnowledgeUnit, KnowledgeUnit, float]]]:
+    """增量相似度扫描（优化版：预计算 n-gram）。
+
+    返回 (intra_topic_pairs, cross_topic_pairs)。
+    intra: 同主题内 ≥ threshold 的对（送 LLM）
+    cross: 跨主题 ≥ threshold 的对（仅报告）
+    """
+    intra_pairs: List[tuple[KnowledgeUnit, KnowledgeUnit, float]] = []
+    cross_pairs: List[tuple[KnowledgeUnit, KnowledgeUnit, float]] = []
+
+    # 建立 unit → topic 索引
+    unit_topic: Dict[str, str] = {}
+    for topic_name, units in topic_units.items():
+        for u in units:
+            unit_topic[u.fingerprint] = topic_name
+
+    # 识别新增单元
+    new_fps = {u.fingerprint for u in all_units} - cached_fps
+
+    # 预计算所有单元的 n-gram 集合（一次性）
+    print(f"[synthesize] 预计算 {len(all_units)} 条单元的 n-gram...")
+    ngram_cache: Dict[str, frozenset] = {}
+    for u in all_units:
+        if u.fingerprint not in ngram_cache:
+            ngram_cache[u.fingerprint] = _compute_ngrams(u.body, ngram_size)
+
+    # 同主题内扫描：新↔新 + 新↔旧
+    total_intra_comparisons = 0
+    for topic_name, units in topic_units.items():
+        new_in_topic = [u for u in units if u.fingerprint in new_fps]
+        old_in_topic = [u for u in units if u.fingerprint not in new_fps]
+
+        pairs_to_check = (
+            len(new_in_topic) * (len(new_in_topic) - 1) // 2
+            + len(new_in_topic) * len(old_in_topic)
+        )
+        if pairs_to_check == 0:
+            continue
+
+        total_intra_comparisons += pairs_to_check
+        print(f"[synthesize] 扫描 {topic_name}: {len(new_in_topic)} 新 × {len(old_in_topic)} 旧 = {pairs_to_check} 对")
+
+        # 新↔新
+        for i in range(len(new_in_topic)):
+            ng_i = ngram_cache[new_in_topic[i].fingerprint]
+            for j in range(i + 1, len(new_in_topic)):
+                sim = _jaccard_from_sets(ng_i, ngram_cache[new_in_topic[j].fingerprint])
+                if sim >= threshold:
+                    intra_pairs.append((new_in_topic[i], new_in_topic[j], sim))
+
+        # 新↔旧
+        for new_u in new_in_topic:
+            ng_new = ngram_cache[new_u.fingerprint]
+            for old_u in old_in_topic:
+                sim = _jaccard_from_sets(ng_new, ngram_cache[old_u.fingerprint])
+                if sim >= threshold:
+                    intra_pairs.append((new_u, old_u, sim))
+
+    print(f"[synthesize] 同主题扫描完成: {total_intra_comparisons} 次比较, {len(intra_pairs)} 对超过阈值")
+
+    # 跨主题扫描：仅对新单元采样（限制计算量）
+    # 每个主题最多取 50 条新单元做跨主题扫描
+    CROSS_TOPIC_SAMPLE = 50
+    topic_names = list(topic_units.keys())
+    cross_comparisons = 0
+
+    for ti in range(len(topic_names)):
+        for tj in range(ti + 1, len(topic_names)):
+            units_a = topic_units[topic_names[ti]]
+            units_b = topic_units[topic_names[tj]]
+            new_a = [u for u in units_a if u.fingerprint in new_fps][:CROSS_TOPIC_SAMPLE]
+            new_b = [u for u in units_b if u.fingerprint in new_fps][:CROSS_TOPIC_SAMPLE]
+
+            # 双向：A的新↔B的新
+            for ua in new_a:
+                ng_a = ngram_cache[ua.fingerprint]
+                for ub in new_b:
+                    sim = _jaccard_from_sets(ng_a, ngram_cache[ub.fingerprint])
+                    cross_comparisons += 1
+                    if sim >= threshold:
+                        cross_pairs.append((ua, ub, sim))
+
+    print(f"[synthesize] 跨主题扫描完成: {cross_comparisons} 次比较, {len(cross_pairs)} 对超过阈值")
+
+    return intra_pairs, cross_pairs
+
+
+def build_dedup_prompt(pairs: List[tuple[KnowledgeUnit, KnowledgeUnit, float]]) -> str:
+    """构建批量 LLM 判断 prompt。"""
+    lines = [
+        "请判断以下知识单元对是否重复。对每一对回答 DUPLICATE / MERGE / KEEP_BOTH。\n"
+        "- DUPLICATE：完全重复，给出保留哪条（优先保留 P0）\n"
+        "- MERGE：部分重复有互补内容，给出合并后的完整版本\n"
+        "- KEEP_BOTH：不重复，各有独特价值\n"
+    ]
+    for idx, (a, b, sim) in enumerate(pairs, 1):
+        lines.append(f"\n【对{idx}】（相似度: {sim:.0%}）")
+        lines.append(f"A (P{a.priority}): [{a.tag}] {a.title}")
+        # 限制展示的 body 长度（每条最多 2000 字符）
+        body_a = a.body[:2000] + ("..." if len(a.body) > 2000 else "")
+        body_b = b.body[:2000] + ("..." if len(b.body) > 2000 else "")
+        lines.append(body_a)
+        lines.append(f"\nB (P{b.priority}): [{b.tag}] {b.title}")
+        lines.append(body_b)
+
+    lines.append(
+        "\n请用 JSON 数组格式回答：\n"
+        '[{"pair": 1, "verdict": "DUPLICATE", "keep": "A"}, '
+        '{"pair": 2, "verdict": "MERGE", "merged_text": "合并后完整文本..."}, '
+        '{"pair": 3, "verdict": "KEEP_BOTH"}]'
+    )
+    return "\n".join(lines)
+
+
+def apply_dedup_verdicts(
+    topic_units: Dict[str, List[KnowledgeUnit]],
+    judgments: Dict[str, dict],
+) -> Dict[str, List[KnowledgeUnit]]:
+    """根据判断结果去重/合并，返回去重后的 topic → units。"""
+    # 收集需要删除的指纹和需要替换的指纹
+    drop_fps: set = set()
+    replacements: Dict[str, KnowledgeUnit] = {}  # fp → replacement unit
+
+    for pair_key, judgment in judgments.items():
+        verdict = judgment.get("verdict", "KEEP_BOTH")
+        if verdict == "DUPLICATE":
+            drop_fp = judgment.get("drop", "")
+            if drop_fp:
+                drop_fps.add(drop_fp)
+        elif verdict == "MERGE":
+            merged_text = judgment.get("merged_text", "")
+            if merged_text:
+                fps = pair_key.split("_")
+                if len(fps) == 2:
+                    # 两条都删除，用合并版替代第一条
+                    drop_fps.add(fps[1])
+                    keep_fp = fps[0]
+                    # 从现有单元中找到 keep 的元信息
+                    for units in topic_units.values():
+                        for u in units:
+                            if u.fingerprint == keep_fp:
+                                new_fp = hashlib.sha256(merged_text.encode("utf-8")).hexdigest()[:16]
+                                replacements[keep_fp] = KnowledgeUnit(
+                                    tag=u.tag,
+                                    priority=u.priority,
+                                    title=u.title,
+                                    body=merged_text,
+                                    fingerprint=new_fp,
+                                )
+                                break
+
+    result: Dict[str, List[KnowledgeUnit]] = {}
+    for topic_name, units in topic_units.items():
+        filtered: List[KnowledgeUnit] = []
+        for u in units:
+            if u.fingerprint in drop_fps:
+                continue
+            if u.fingerprint in replacements:
+                filtered.append(replacements[u.fingerprint])
+            else:
+                filtered.append(u)
+        # 按优先级排序
+        filtered.sort(key=lambda x: x.priority)
+        result[topic_name] = filtered
+    return result
+
+
+def write_topic_files(
+    topic_units: Dict[str, List[KnowledgeUnit]],
+    topics_dir: Path,
+    max_kb: int,
+    topic_fp_cache: dict,
+) -> List[str]:
+    """按优先级排序 + 100KB 分卷写入主题文件。
+
+    返回写入的文件名列表。
+    """
+    written_files: List[str] = []
+
+    for topic_name, units in sorted(topic_units.items(), key=lambda kv: (kv[0] == "未分类", kv[0])):
+        if not units:
+            continue
+
+        # 计算内容指纹
+        content_fp = hashlib.sha256(
+            "".join(u.body for u in units).encode("utf-8")
+        ).hexdigest()[:16]
+
+        # 检查缓存
+        cached = topic_fp_cache.get(topic_name, {})
+        if isinstance(cached, dict) and cached.get("fingerprint") == content_fp:
+            # 检查文件是否存在
+            cached_files = cached.get("files", [])
+            if cached_files and all((topics_dir / f).is_file() for f in cached_files):
+                print(f"[synthesize] {topic_name}: 内容未变，跳过写入")
+                written_files.extend(cached_files)
+                continue
+
+        # 拼接全部内容
+        full_text = "\n\n".join(u.body for u in units)
+        full_bytes = len(full_text.encode("utf-8"))
+        max_bytes = max_kb * 1024
+
+        # 清理该主题的旧文件
+        base_name = f"{topic_name}.md"
+        for old_file in topics_dir.glob(f"{topic_name}*.md"):
+            old_file.unlink()
+
+        if full_bytes <= max_bytes:
+            # 单文件
+            file_path = topics_dir / base_name
+            file_path.write_text(full_text, encoding="utf-8")
+            written_files.append(base_name)
+            topic_fp_cache[topic_name] = {"fingerprint": content_fp, "files": [base_name]}
+            print(f"[synthesize] → {base_name} ({full_bytes / 1024:.1f}KB)")
+        else:
+            # 分卷：按知识单元边界切分
+            volume_files: List[str] = []
+            current_parts: List[str] = []
+            current_size = 0
+            vol_num = 1
+
+            for u in units:
+                u_bytes = len(u.body.encode("utf-8"))
+                if current_parts and current_size + u_bytes + 2 > max_bytes:
+                    # 写入当前卷
+                    vol_name = base_name if vol_num == 1 else f"{topic_name}-{vol_num:03d}.md"
+                    vol_path = topics_dir / vol_name
+                    vol_path.write_text("\n\n".join(current_parts), encoding="utf-8")
+                    volume_files.append(vol_name)
+                    print(f"[synthesize] → {vol_name} ({current_size / 1024:.1f}KB)")
+                    current_parts = []
+                    current_size = 0
+                    vol_num += 1
+
+                current_parts.append(u.body)
+                current_size += u_bytes + 2
+
+            if current_parts:
+                vol_name = base_name if vol_num == 1 else f"{topic_name}-{vol_num:03d}.md"
+                vol_path = topics_dir / vol_name
+                vol_path.write_text("\n\n".join(current_parts), encoding="utf-8")
+                volume_files.append(vol_name)
+                print(f"[synthesize] → {vol_name} ({current_size / 1024:.1f}KB)")
+
+            written_files.extend(volume_files)
+            topic_fp_cache[topic_name] = {"fingerprint": content_fp, "files": volume_files}
+
+    return written_files
+
+
+def generate_index(
+    topics_dir: Path,
+    topic_units: Dict[str, List[KnowledgeUnit]],
+    unmapped_tags: List[str],
+    tag_buckets: Dict[str, List[KnowledgeUnit]],
+    mapping: Dict[str, List[str]],
+) -> None:
+    """生成 00-目录与导读.md。"""
+    lines = [
+        "# 网文新人指南\n",
+        "> 从零开始写网文的系统学习路径\n",
+        "## 目录\n",
+        "| 序号 | 主题 | 知识单元 | P0 | P1 | P2 | 包含标签 |",
+        "|:--|:--|:--|:--|:--|:--|:--|",
+    ]
+
+    sorted_topics = sorted(
+        [(k, v) for k, v in topic_units.items() if k != "未分类"],
+        key=lambda kv: kv[0],
+    )
+
+    for topic_name, units in sorted_topics:
+        seq = topic_name.split("-")[0] if "-" in topic_name else "?"
+        total = len(units)
+        p0 = sum(1 for u in units if u.priority == 0)
+        p1 = sum(1 for u in units if u.priority == 1)
+        p2 = sum(1 for u in units if u.priority >= 2)
+        tags = mapping.get(topic_name, [])
+        tags_str = "、".join(tags[:6]) + ("..." if len(tags) > 6 else "")
+        lines.append(f"| {seq} | {topic_name} | {total} 条 | {p0} | {p1} | {p2} | {tags_str} |")
+
+    lines.append("")
+    lines.append("## 如何使用本指南\n")
+    lines.append("- 01-03：写书前必读（认知、选题、开篇）")
+    lines.append("- 04-06：写作过程中反复查阅（元素、节奏、规划）")
+    lines.append("- 07-08：遇到困难时翻阅（避坑、心态）")
+
+    if unmapped_tags:
+        lines.append("")
+        lines.append("## 未分类标签\n")
+        lines.append("以下标签未被映射到任何主题，请检查 config.yaml 的 mapping：")
+        for tag in sorted(unmapped_tags):
+            count = len(tag_buckets.get(tag, []))
+            lines.append(f"- {tag}（{count} 条知识单元）")
+
+    index_path = topics_dir / "00-目录与导读.md"
+    index_path.write_text("\n".join(lines), encoding="utf-8")
+    print(f"[synthesize] → 00-目录与导读.md")
+
+
+def generate_cross_topic_report(
+    cross_pairs: List[tuple[KnowledgeUnit, KnowledgeUnit, float]],
+    unit_topic: Dict[str, str],
+    intermediate_dir: Path,
+) -> None:
+    """生成跨主题相似度报告。"""
+    if not cross_pairs:
+        print("[synthesize] 无跨主题相似对，跳过报告")
+        return
+
+    lines = ["跨主题相似度报告（阈值: 70%）\n"]
+
+    sorted_pairs = sorted(cross_pairs, key=lambda x: x[2], reverse=True)
+    for a, b, sim in sorted_pairs[:50]:  # 最多报告 50 对
+        topic_a = unit_topic.get(a.fingerprint, "?")
+        topic_b = unit_topic.get(b.fingerprint, "?")
+        preview_a = a.body[:80].replace("\n", " ")
+        preview_b = b.body[:80].replace("\n", " ")
+        lines.append(f"[{sim:.0%}] ⚠ 跨主题:")
+        lines.append(f"  主题A: {topic_a} | 标签: {a.tag} | P{a.priority} | \"{preview_a}\"")
+        lines.append(f"  主题B: {topic_b} | 标签: {b.tag} | P{b.priority} | \"{preview_b}\"")
+        lines.append(f"  → 建议检查 mapping 是否需要调整")
+        lines.append("")
+
+    report_path = intermediate_dir / "cross_topic_similarity.txt"
+    report_path.write_text("\n".join(lines), encoding="utf-8")
+    print(f"[synthesize] → 跨主题相似度报告: {len(sorted_pairs[:50])} 对")
 
 
 def run_synthesize_stage(
@@ -2406,7 +2853,15 @@ def run_synthesize_stage(
     extract_dir: Path,
     full_resync: bool = False,
 ) -> None:
-    """Synthesize 阶段：按分类标签归组 → 标签合并 → 逐分类 LLM 合并去重。"""
+    """Synthesize 阶段：六阶段流水线。
+
+    Phase 1: 结构化解析 + 归组（纯代码）
+    Phase 2: 增量相似度扫描（n-gram Jaccard，纯代码）
+    Phase 3: 疑似重复对送 LLM 判断（仅限同主题内 ≥ threshold）
+    Phase 4: 内存中去重/合并
+    Phase 5: 拼接写入文件（含 100KB 分卷）
+    Phase 6: 生成 00-目录与导读.md + 跨主题相似度报告
+    """
 
     log_dir = config.output_dir / "_logs"
     endpoint_states = _create_endpoint_states(config, config.synthesize_stage, log_dir=log_dir)
@@ -2415,15 +2870,20 @@ def run_synthesize_stage(
     topics_dir = config.output_dir / "topics"
     topics_dir.mkdir(parents=True, exist_ok=True)
 
+    sim_cfg = config.merge.similarity
+    mapping = config.merge.mapping
+
     # ── 缓存检查（基于 extract 指纹 + merge 配置签名） ──
     fingerprint_path = intermediate_dir / "synthesize_fingerprint.txt"
     manifest_path = intermediate_dir / "synthesize_manifest.json"
     extract_fp = _compute_extract_fingerprint(extract_dir)
     merge_sig = hashlib.sha256(
         json.dumps({
-            "target_categories": config.merge.target_categories,
-            "use_llm": config.merge.use_llm,
-            "mapping": config.merge.mapping,
+            "mapping": mapping,
+            "similarity": {
+                "threshold": sim_cfg.threshold,
+                "ngram_size": sim_cfg.ngram_size,
+            },
         }, ensure_ascii=False, sort_keys=True).encode("utf-8")
     ).hexdigest()[:16]
     current_fingerprint = f"{extract_fp}_{merge_sig}"
@@ -2441,396 +2901,240 @@ def run_synthesize_stage(
             except (json.JSONDecodeError, KeyError):
                 pass
 
-    # ── per-topic 指纹缓存（增量模式：仅重做输入变化的主题） ──
+    # ── 加载缓存 ──
+    unit_fp_path = intermediate_dir / "unit_fingerprints.json"
+    dedup_cache_path = intermediate_dir / "dedup_judgments.json"
     topic_fp_path = intermediate_dir / "synthesize_topic_fingerprints.json"
-    cached_topic_fps: dict[str, dict] = {}
-    if topic_fp_path.is_file():
+
+    cached_unit_fps: set = set()
+    if not full_resync and unit_fp_path.is_file():
         try:
-            fp_data = json.loads(topic_fp_path.read_text(encoding="utf-8"))
-            # merge 配置变更 → 全部失效
+            fp_data = json.loads(unit_fp_path.read_text(encoding="utf-8"))
             if fp_data.get("merge_sig") == merge_sig:
-                raw_topics = fp_data.get("topics", {})
-                for k, v in raw_topics.items():
-                    if isinstance(v, str):
-                        # 旧格式迁移: str → dict（无 unit_fps → delta 不可用）
-                        cached_topic_fps[k] = {"fingerprint": v, "unit_fps": []}
-                    elif isinstance(v, dict):
-                        cached_topic_fps[k] = v
+                cached_unit_fps = set(fp_data.get("units", {}).keys())
         except (json.JSONDecodeError, KeyError):
             pass
 
-    # 提前写入指纹，使全局 manifest 与当前指纹关联
-    fingerprint_path.write_text(current_fingerprint, encoding="utf-8")
-
-    # ── Phase 1: 按分类标签归组（纯代码，零信息损失） ──
-    print("[synthesize] Phase 1: 按分类标签归组知识单元...")
-    buckets = group_by_category(extract_dir)
-
-    total_units = sum(len(v) for v in buckets.values())
-    print(f"[synthesize] 共 {total_units} 条知识单元，归入 {len(buckets)} 个标签")
-
-    # ── Phase 1.5: 标签合并 ──
-    print("[synthesize] Phase 1.5: 标签合并...")
-    mapping = _resolve_tag_mapping(
-        list(buckets.keys()), config.merge,
-        config.synthesize_stage, endpoint_states, config.runtime,
-    )
-    merged_buckets = _apply_tag_grouping(buckets, mapping)
-    mapping_mode = "manual" if config.merge.mapping else ("llm" if config.merge.use_llm else "identity")
-
-    # 排序：未分类放最后
-    topic_names = sorted(merged_buckets.keys(), key=lambda k: (k == "未分类", k))
-
-    print(f"[synthesize] 合并后 {len(topic_names)} 个分类：")
-    for name in topic_names:
-        units = merged_buckets[name]
-        total_kb = sum(len(u.encode("utf-8")) for u in units) / 1024.0
-        print(f"  - {name}: {len(units)} 条, {total_kb:.1f}KB")
-
-    # ── Phase 2: 逐分类 LLM 合并去重 ──
-    synth_cfg = config.batching.synthesize
-    effective_limit = get_effective_size_limit(
-        synth_cfg.max_batch_size_kb,
-        config.synthesize_stage.provider,
-        config.batching.provider_limits,
-    )
-    merge_limit = get_effective_size_limit(
-        synth_cfg.max_batch_size_kb,
-        config.synthesize_stage.provider,
-        config.batching.provider_limits,
-        safety_margin=0.90,  # 合并 pass 用 0.90（prompt 比合成简单）
-    )
-    synthesize_system_prompt = config.synthesize_stage.system_prompt
-
-    topic_files: List[str] = []
-    total = len(topic_names)
-
-    # ── 并发执行基础设施 ──
-    manifest_lock = threading.Lock()
-    stop_event = threading.Event()
-    consecutive_all_fail = [0]           # 连续全端点失败轮次（跨线程共享）
-    ALL_FAIL_THRESHOLD = 3              # 连续 N 轮 → 升级为熔断终止
-    topic_files_lock = threading.Lock()
-    synth_worker_id_counter = [0]
-    synth_worker_id_lock = threading.Lock()
-    synth_clog = _ConcurrentLog("synthesize", config.concurrency.max_workers, total)
-
-    def _process_topic(i: int, topic_name: str) -> str | None:
-        """处理单个主题（线程安全），返回输出文件名或 None。"""
-        if stop_event.is_set():
-            synth_clog.record(
-                worker=threading.current_thread().name,
-                unit=topic_name,
-                status="skip",
-                duration_s=0.0,
-            )
-            return None
-
-        units = merged_buckets[topic_name]
-        combined_text = "\n\n---\n\n".join(units)
-        combined_kb = len(combined_text.encode("utf-8")) / 1024.0
-
-        filename = f"{i:02d}_{safe_filename(topic_name)}.md"
-        topic_path = topics_dir / filename
-
-        # 为并发模式分配 worker ID
-        s_max_workers = config.concurrency.max_workers
-        s_tag = ""
-        if s_max_workers > 1:
-            with synth_worker_id_lock:
-                swid = synth_worker_id_counter[0]
-                synth_worker_id_counter[0] += 1
-            s_tag = f" W{swid % s_max_workers}"
-
-        t0 = time.time()
-        worker_name = threading.current_thread().name
-
-        # ── 增量缓存：基于内容匹配（而非主题名），避免 LLM 改名导致缓存失效 ──
-        current_fp = _compute_topic_fingerprint(units)
-        current_unit_fps = _compute_unit_fingerprints(units)
-
-        # 线程安全地查找缓存匹配（防止并发时多个主题争抢同一缓存条目）
-        with manifest_lock:
-            # 1) 先尝试精确名称匹配（快速路径）
-            cached_entry = cached_topic_fps.get(topic_name, {})
-            matched_cache_name = topic_name if cached_entry else None
-
-            # 2) 名称未命中 → 基于 unit_fps 重叠度查找
-            if not cached_entry:
-                matched_cache_name, cached_entry = _find_best_cached_match(
-                    cached_topic_fps, current_unit_fps,
-                )
-                if matched_cache_name:
-                    # 立即从旧名称移除，防止其他线程重复匹配
-                    cached_topic_fps.pop(matched_cache_name)
-                    # 暂存到新名称下（后续路径会更新完整信息）
-                    cached_topic_fps[topic_name] = cached_entry
-                    print(
-                        f"[synthesize{s_tag}] 内容匹配: "
-                        f"'{topic_name}' ← 缓存 '{matched_cache_name}'"
-                    )
-
-        cached_fp = cached_entry.get("fingerprint", "") if isinstance(cached_entry, dict) else (cached_entry if isinstance(cached_entry, str) else "")
-        cached_unit_fps = cached_entry.get("unit_fps", []) if isinstance(cached_entry, dict) else []
-        cached_output_file = cached_entry.get("output_file", "") if isinstance(cached_entry, dict) else ""
-
-        # 解析已有输出文件路径（当主题名变更时，从缓存的 output_file 定位旧文件）
-        existing_output_path = topic_path  # 默认：当前名称对应的路径
-        if cached_output_file and not topic_path.is_file():
-            old_path = topics_dir / cached_output_file
-            if old_path.is_file():
-                existing_output_path = old_path
-
-        if (cached_fp == current_fp and
-                existing_output_path.is_file()):
-            # 如果匹配的缓存来自不同名称，将旧文件重命名为新名称
-            if existing_output_path != topic_path:
-                existing_output_path.rename(topic_path)
-                print(f"[synthesize{s_tag}] 重命名: {existing_output_path.name} → {filename}")
-            # 清理旧缓存条目，写入新名称条目
-            if matched_cache_name and matched_cache_name != topic_name:
-                with manifest_lock:
-                    cached_topic_fps[topic_name] = {
-                        "fingerprint": current_fp,
-                        "unit_fps": current_unit_fps,
-                        "output_file": filename,
-                    }
-                    _save_topic_fingerprints(topic_fp_path, merge_sig, cached_topic_fps)
-            print(f"[synthesize{s_tag} {i}/{total}] {topic_name} (内容未变，跳过)")
-            synth_clog.record(worker=worker_name, unit=topic_name, status="skip", duration_s=0.0)
-            return filename
-
-        # ── Delta 增量合成 ──
-        current_unit_fps_set = set(current_unit_fps)
-        cached_unit_fps_set = set(cached_unit_fps)
-        new_unit_fps = current_unit_fps_set - cached_unit_fps_set
-        deleted_unit_fps = cached_unit_fps_set - current_unit_fps_set
-
-        if (not full_resync
-                and cached_unit_fps  # 有 unit_fps 缓存
-                and existing_output_path.is_file()  # 输出文件存在
-                and not deleted_unit_fps  # 无删除
-                and new_unit_fps  # 有新增
-                and len(new_unit_fps) <= len(current_unit_fps) * 0.5):  # 新增 ≤ 50%
-            # 找出新增的知识单元
-            new_units = [u for u, fp in zip(units, current_unit_fps) if fp in new_unit_fps]
-            delta_text = "\n\n---\n\n".join(new_units)
-            delta_kb = len(delta_text.encode("utf-8")) / 1024.0
-
-            if delta_kb <= effective_limit:
-                print(
-                    f"[synthesize{s_tag} {i}/{total}] {topic_name} "
-                    f"(Delta: {len(new_units)} 条新增, {delta_kb:.1f}KB)"
-                )
-                delta_prompt = (
-                    f"以下是关于【{topic_name}】这一主题的 {len(new_units)} 条新增知识单元，"
-                    f"来自不同来源的提取结果。请按规则合并整理，保留所有独特内容。\n\n"
-                    + delta_text
-                )
-                try:
-                    raw = call_llm_with_continuation(
-                        stage=config.synthesize_stage,
-                        endpoint_states=endpoint_states,
-                        system_prompt=synthesize_system_prompt,
-                        user_prompt=delta_prompt,
-                        runtime=config.runtime,
-                    )
-                    delta_result = strip_code_fences(raw)
-                    # 如果旧文件名不同，先重命名
-                    if existing_output_path != topic_path and existing_output_path.is_file():
-                        existing_output_path.rename(topic_path)
-                    # 追加到已有输出文件末尾
-                    existing_text = topic_path.read_text(encoding="utf-8")
-                    merged_text = existing_text + "\n\n---\n\n" + delta_result
-                    topic_path.write_text(merged_text, encoding="utf-8")
-                    merged_kb = len(merged_text.encode("utf-8")) / 1024.0
-                    print(f"[synthesize{s_tag}] → Delta 追加: {filename} ({merged_kb:.1f}KB)")
-                    with manifest_lock:
-                        consecutive_all_fail[0] = 0
-                        cached_topic_fps[topic_name] = {"fingerprint": current_fp, "unit_fps": current_unit_fps, "output_file": filename}
-                        _save_topic_fingerprints(topic_fp_path, merge_sig, cached_topic_fps)
-                    synth_clog.record(worker=worker_name, unit=topic_name, status="ok", duration_s=time.time() - t0)
-                    return filename
-                except PipelineError:
-                    print(f"[synthesize{s_tag}] Delta 合成失败，回退全量")
-            else:
-                print(f"[synthesize{s_tag}] Delta 过大 ({delta_kb:.1f}KB)，回退全量")
-
-        print(f"[synthesize{s_tag} {i}/{total}] {topic_name} ({len(units)} 条, {combined_kb:.1f}KB)")
-
-        if len(units) == 1:
-            print(f"[synthesize{s_tag}] → 仅 1 条，直接写入: {filename}")
-            topic_path.write_text(units[0], encoding="utf-8")
-            with manifest_lock:
-                cached_topic_fps[topic_name] = {"fingerprint": current_fp, "unit_fps": current_unit_fps, "output_file": filename}
-                _save_topic_fingerprints(topic_fp_path, merge_sig, cached_topic_fps)
-            synth_clog.record(worker=worker_name, unit=topic_name, status="ok", duration_s=time.time() - t0)
-            return filename
-
-        user_prompt = (
-            f"以下是关于【{topic_name}】这一主题的 {len(units)} 条知识单元，"
-            f"来自不同来源的提取结果。请按规则合并整理，保留所有独特内容。\n\n"
-            + combined_text
-        )
-
+    cached_judgments: Dict[str, dict] = {}
+    cached_dedup_sig = ""
+    if not full_resync and dedup_cache_path.is_file():
         try:
-            if combined_kb <= effective_limit:
-                raw = call_llm_with_continuation(
+            dedup_data = json.loads(dedup_cache_path.read_text(encoding="utf-8"))
+            cached_dedup_sig = dedup_data.get("merge_sig", "")
+            if cached_dedup_sig == merge_sig:
+                cached_judgments = dedup_data.get("judgments", {})
+        except (json.JSONDecodeError, KeyError):
+            pass
+
+    topic_fp_cache: dict = {}
+    if not full_resync and topic_fp_path.is_file():
+        try:
+            fp_data = json.loads(topic_fp_path.read_text(encoding="utf-8"))
+            if fp_data.get("merge_sig") == merge_sig:
+                topic_fp_cache = fp_data.get("topics", {})
+        except (json.JSONDecodeError, KeyError):
+            pass
+
+    # ══════════════════════════════════════════════════════════
+    # Phase 1: 结构化解析 + 归组（纯代码）
+    # ══════════════════════════════════════════════════════════
+    print("[synthesize] Phase 1: 结构化解析 + 归组...")
+    tag_buckets, all_units = group_by_category(extract_dir)
+    total_units = len(all_units)
+    print(f"[synthesize] 共 {total_units} 条知识单元，归入 {len(tag_buckets)} 个标签")
+
+    # 标签→主题映射
+    if mapping:
+        print("[synthesize] 使用 config.yaml 手动标签映射")
+        topic_units, unmapped_tags = apply_topic_mapping(tag_buckets, mapping)
+    else:
+        print("[synthesize] 无映射配置，每个标签独立成主题")
+        topic_units = {k: v for k, v in tag_buckets.items()}
+        unmapped_tags = []
+
+    # 排序显示
+    topic_names = sorted(topic_units.keys(), key=lambda k: (k == "未分类", k))
+    print(f"[synthesize] 合并后 {len(topic_names)} 个主题：")
+    for name in topic_names:
+        units = topic_units[name]
+        total_kb = sum(len(u.body.encode("utf-8")) for u in units) / 1024.0
+        p_counts = {0: 0, 1: 0, 2: 0}
+        for u in units:
+            if u.priority in p_counts:
+                p_counts[u.priority] += 1
+        print(f"  - {name}: {len(units)} 条 (P0={p_counts[0]}, P1={p_counts[1]}, P2={p_counts[2]}), {total_kb:.1f}KB")
+
+    if unmapped_tags:
+        print(f"[synthesize] ⚠ 未映射标签 ({len(unmapped_tags)}): {', '.join(unmapped_tags[:10])}")
+
+    # 保存 unit 指纹缓存
+    unit_fp_data = {
+        "merge_sig": merge_sig,
+        "units": {},
+    }
+    unit_topic_map: Dict[str, str] = {}
+    for topic_name, units in topic_units.items():
+        for u in units:
+            unit_fp_data["units"][u.fingerprint] = {
+                "tag": u.tag, "topic": topic_name, "priority": u.priority,
+            }
+            unit_topic_map[u.fingerprint] = topic_name
+    dump_json(unit_fp_path, unit_fp_data)
+
+    # ══════════════════════════════════════════════════════════
+    # Phase 2: 增量相似度扫描（n-gram Jaccard，纯代码）
+    # ══════════════════════════════════════════════════════════
+    print(f"[synthesize] Phase 2: 增量相似度扫描 (阈值={sim_cfg.threshold:.0%}, n={sim_cfg.ngram_size})...")
+    all_fps = {u.fingerprint for u in all_units}
+    new_fps = all_fps - cached_unit_fps
+    print(f"[synthesize] 全量 {len(all_fps)} 条, 新增 {len(new_fps)} 条, 缓存 {len(cached_unit_fps)} 条")
+
+    if not new_fps and cached_unit_fps:
+        print("[synthesize] 无新增单元，跳过相似度扫描")
+        intra_pairs: List[tuple[KnowledgeUnit, KnowledgeUnit, float]] = []
+        cross_pairs: List[tuple[KnowledgeUnit, KnowledgeUnit, float]] = []
+    else:
+        intra_pairs, cross_pairs = scan_similarity(
+            topic_units, all_units, cached_unit_fps,
+            sim_cfg.threshold, sim_cfg.ngram_size,
+        )
+    print(f"[synthesize] 同主题相似对: {len(intra_pairs)}, 跨主题相似对: {len(cross_pairs)}")
+
+    # ══════════════════════════════════════════════════════════
+    # Phase 3: 疑似重复对送 LLM 判断（仅同主题内）
+    # ══════════════════════════════════════════════════════════
+    print(f"[synthesize] Phase 3: LLM 重复判断...")
+
+    # 过滤已有缓存的判断
+    new_pairs: List[tuple[KnowledgeUnit, KnowledgeUnit, float]] = []
+    for a, b, sim in intra_pairs:
+        pair_key = "_".join(sorted([a.fingerprint, b.fingerprint]))
+        if pair_key not in cached_judgments:
+            new_pairs.append((a, b, sim))
+
+    print(f"[synthesize] 需要 LLM 判断: {len(new_pairs)} 对 (已缓存: {len(intra_pairs) - len(new_pairs)} 对)")
+
+    # 批量送 LLM
+    if new_pairs:
+        batch_size = sim_cfg.llm_batch_size
+        system_prompt = config.synthesize_stage.system_prompt
+        consecutive_all_fail = 0
+
+        for batch_start in range(0, len(new_pairs), batch_size):
+            batch = new_pairs[batch_start:batch_start + batch_size]
+            print(f"[synthesize] LLM 判断批次 {batch_start // batch_size + 1}: {len(batch)} 对")
+
+            prompt = build_dedup_prompt(batch)
+            try:
+                raw = call_llm_with_failover(
                     stage=config.synthesize_stage,
                     endpoint_states=endpoint_states,
-                    system_prompt=synthesize_system_prompt,
-                    user_prompt=user_prompt,
+                    system_prompt=system_prompt,
+                    user_prompt=prompt,
                     runtime=config.runtime,
                 )
-                result = strip_code_fences(raw)
-                topic_path.write_text(result, encoding="utf-8")
-                result_kb = len(result.encode("utf-8")) / 1024.0
-                print(f"[synthesize{s_tag}] → {filename} ({result_kb:.1f}KB)")
-                with manifest_lock:
-                    consecutive_all_fail[0] = 0
-            else:
-                print(
-                    f"[synthesize{s_tag}] 主题过大 ({combined_kb:.1f}KB > {effective_limit}KB)，分批处理"
-                )
-                sub_batches = compute_batches(
-                    [{"text": u} for u in units],
-                    999,
-                    effective_limit,
-                )
+                results = _repair_json(raw)
+                if not isinstance(results, list):
+                    results = [results]
 
-                sub_results: List[str] = []
-                for si, sub_batch in enumerate(sub_batches, 1):
-                    if stop_event.is_set():
-                        synth_clog.record(worker=worker_name, unit=topic_name, status="skip", duration_s=time.time() - t0)
-                        return None
-                    sub_text = "\n\n---\n\n".join(item["text"] for item in sub_batch)
-                    sub_kb = len(sub_text.encode("utf-8")) / 1024.0
-                    print(f"[synthesize{s_tag}]   子批 {si}/{len(sub_batches)}: {sub_kb:.1f}KB")
+                consecutive_all_fail = 0
 
-                    sub_prompt = (
-                        f"以下是关于【{topic_name}】这一主题的部分知识单元"
-                        f"（第 {si}/{len(sub_batches)} 批）。"
-                        f"请合并整理，保留所有独特内容。\n\n"
-                        + sub_text
-                    )
+                for item in results:
+                    pair_idx = item.get("pair", 0) - 1
+                    if 0 <= pair_idx < len(batch):
+                        a, b, sim = batch[pair_idx]
+                        pair_key = "_".join(sorted([a.fingerprint, b.fingerprint]))
+                        verdict = item.get("verdict", "KEEP_BOTH")
+                        judgment: dict = {"verdict": verdict}
 
-                    try:
-                        raw = call_llm_with_continuation(
-                            stage=config.synthesize_stage,
-                            endpoint_states=endpoint_states,
-                            system_prompt=synthesize_system_prompt,
-                            user_prompt=sub_prompt,
-                            runtime=config.runtime,
-                        )
-                        sub_results.append(strip_code_fences(raw))
-                        with manifest_lock:
-                            consecutive_all_fail[0] = 0
-                    except PipelineError as exc:
-                        if isinstance(exc, EndpointsExhaustedError):
-                            raise
-                        with manifest_lock:
-                            consecutive_all_fail[0] += 1
-                            if consecutive_all_fail[0] >= ALL_FAIL_THRESHOLD:
-                                print(f"[synthesize{s_tag}] 连续 {consecutive_all_fail[0]} 轮全端点失败，触发熔断终止")
-                                stop_event.set()
-                                raise EndpointsExhaustedError(
-                                    f"连续 {consecutive_all_fail[0]} 轮全端点调用失败，终止处理"
-                                ) from exc
-                        print(f"[synthesize{s_tag}]   子批 {si} 失败: {exc}，保留原文")
-                        sub_results.append(sub_text)
+                        if verdict == "DUPLICATE":
+                            keep_side = item.get("keep", "A")
+                            if keep_side == "B":
+                                judgment["keep"] = b.fingerprint
+                                judgment["drop"] = a.fingerprint
+                            else:
+                                judgment["keep"] = a.fingerprint
+                                judgment["drop"] = b.fingerprint
+                        elif verdict == "MERGE":
+                            judgment["merged_text"] = item.get("merged_text", "")
 
-                if len(sub_results) > 1:
-                    print(f"[synthesize{s_tag}] 跨批去重合并 ({len(sub_results)} 段)...")
-                    final_text = _merge_reduce_sub_results(
-                        sub_results, topic_name, merge_limit,
-                        config.synthesize_stage, endpoint_states, config.runtime,
-                        s_tag, stop_event, manifest_lock,
-                        consecutive_all_fail, ALL_FAIL_THRESHOLD,
-                    )
-                else:
-                    final_text = sub_results[0] if sub_results else ""
-                topic_path.write_text(final_text, encoding="utf-8")
-                final_kb = len(final_text.encode("utf-8")) / 1024.0
-                print(f"[synthesize{s_tag}] → {filename} ({final_kb:.1f}KB)")
+                        cached_judgments[pair_key] = judgment
 
-            synth_clog.record(worker=worker_name, unit=topic_name, status="ok", duration_s=time.time() - t0)
-
-        except EndpointsExhaustedError:
-            synth_clog.record(worker=worker_name, unit=topic_name, status="error", duration_s=time.time() - t0, error="EndpointsExhausted")
-            stop_event.set()
-            raise
-        except PipelineError as exc:
-            synth_clog.record(worker=worker_name, unit=topic_name, status="error", duration_s=time.time() - t0, error=str(exc))
-            with manifest_lock:
-                consecutive_all_fail[0] += 1
-                if consecutive_all_fail[0] >= ALL_FAIL_THRESHOLD:
-                    print(f"[synthesize{s_tag}] 连续 {consecutive_all_fail[0]} 轮全端点失败，触发熔断终止")
-                    stop_event.set()
-                    raise EndpointsExhaustedError(
-                        f"连续 {consecutive_all_fail[0]} 轮全端点调用失败，终止处理"
-                    ) from exc
-            print(f"[synthesize{s_tag}] 失败: {topic_name}: {exc}")
-            topic_path.write_text(combined_text, encoding="utf-8")
-            print(f"[synthesize{s_tag}] → 降级为原文拼接: {filename}")
-
-        with manifest_lock:
-            cached_topic_fps[topic_name] = {"fingerprint": current_fp, "unit_fps": current_unit_fps, "output_file": filename}
-            _save_topic_fingerprints(topic_fp_path, merge_sig, cached_topic_fps)
-        return filename
-
-    # ── 执行（串行 or 并发） ──
-    max_workers = config.concurrency.max_workers
-
-    if max_workers <= 1:
-        for i, topic_name in enumerate(topic_names, 1):
-            result = _process_topic(i, topic_name)
-            if result:
-                topic_files.append(result)
-            if stop_event.is_set():
+            except EndpointsExhaustedError:
+                print("[synthesize] 所有端点熔断，停止 LLM 判断")
                 break
-    else:
-        print(f"[synthesize] 并发模式：max_workers={max_workers}")
-        with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="synth") as executor:
-            futures = {}
-            for i, topic_name in enumerate(topic_names, 1):
-                f = executor.submit(_process_topic, i, topic_name)
-                futures[f] = topic_name
-            try:
-                for future in as_completed(futures):
-                    if stop_event.is_set():
-                        for pending_f in futures:
-                            pending_f.cancel()
-                        break
-                    try:
-                        result = future.result()
-                        if result:
-                            with topic_files_lock:
-                                topic_files.append(result)
-                    except EndpointsExhaustedError:
-                        for pending_f in futures:
-                            pending_f.cancel()
-                        break
-            except KeyboardInterrupt:
-                print("\n[synthesize] 用户中断，取消剩余任务...")
-                executor.shutdown(wait=False, cancel_futures=True)
-                raise
+            except PipelineError as exc:
+                consecutive_all_fail += 1
+                print(f"[synthesize] LLM 判断失败: {exc}")
+                if consecutive_all_fail >= 3:
+                    print("[synthesize] 连续 3 次失败，停止 LLM 判断")
+                    break
 
-    # ── 并发日志输出 ──
-    if max_workers > 1:
-        synth_clog.write_log(log_dir)
-        synth_clog.print_summary()
+    # 保存判断缓存
+    dump_json(dedup_cache_path, {
+        "merge_sig": merge_sig,
+        "judgments": cached_judgments,
+    })
 
-    # 排序确保文件列表顺序一致
-    topic_files.sort()
+    dup_count = sum(1 for j in cached_judgments.values() if j.get("verdict") == "DUPLICATE")
+    merge_count = sum(1 for j in cached_judgments.values() if j.get("verdict") == "MERGE")
+    keep_count = sum(1 for j in cached_judgments.values() if j.get("verdict") == "KEEP_BOTH")
+    print(f"[synthesize] 判断结果: DUPLICATE={dup_count}, MERGE={merge_count}, KEEP_BOTH={keep_count}")
+
+    # ══════════════════════════════════════════════════════════
+    # Phase 4: 内存中去重/合并
+    # ══════════════════════════════════════════════════════════
+    print("[synthesize] Phase 4: 去重/合并...")
+    deduped_units = apply_dedup_verdicts(topic_units, cached_judgments)
+
+    total_before = sum(len(v) for v in topic_units.values())
+    total_after = sum(len(v) for v in deduped_units.values())
+    print(f"[synthesize] 去重前: {total_before} 条, 去重后: {total_after} 条 (减少 {total_before - total_after} 条)")
+
+    # ══════════════════════════════════════════════════════════
+    # Phase 5: 拼接写入文件（含 100KB 分卷）
+    # ══════════════════════════════════════════════════════════
+    print(f"[synthesize] Phase 5: 写入主题文件 (分卷阈值: {sim_cfg.max_file_size_kb}KB)...")
+
+    # 清理 topics 目录中不属于当前 mapping 的旧文件
+    valid_prefixes = set()
+    for topic_name in deduped_units:
+        valid_prefixes.add(topic_name)
+    for old_file in topics_dir.glob("*.md"):
+        if old_file.name == "00-目录与导读.md":
+            continue
+        # 检查文件是否属于当前有效主题
+        belongs = False
+        for prefix in valid_prefixes:
+            if old_file.name.startswith(prefix):
+                belongs = True
+                break
+        if not belongs:
+            old_file.unlink()
+            print(f"[synthesize] 清理旧文件: {old_file.name}")
+
+    topic_files = write_topic_files(
+        deduped_units, topics_dir, sim_cfg.max_file_size_kb, topic_fp_cache,
+    )
+
+    # 保存 topic 指纹缓存
+    _save_topic_fingerprints(topic_fp_path, merge_sig, topic_fp_cache)
+
+    # ══════════════════════════════════════════════════════════
+    # Phase 6: 生成 00-目录与导读.md + 跨主题相似度报告
+    # ══════════════════════════════════════════════════════════
+    print("[synthesize] Phase 6: 生成目录与报告...")
+    generate_index(topics_dir, deduped_units, unmapped_tags, tag_buckets, mapping)
+    generate_cross_topic_report(cross_pairs, unit_topic_map, intermediate_dir)
 
     # ── 写入缓存 manifest ──
+    topic_files.sort()
     manifest_payload = {
         "fingerprint": current_fingerprint,
         "topic_count": len(topic_files),
         "topics_dir": str(topics_dir),
         "topic_files": topic_files,
         "mapping": {k: v for k, v in mapping.items()},
-        "mapping_mode": mapping_mode,
     }
     dump_json(manifest_path, manifest_payload)
     fingerprint_path.write_text(current_fingerprint, encoding="utf-8")
@@ -2840,6 +3144,14 @@ def run_synthesize_stage(
         "topic_count": len(topic_files),
         "topics_dir": str(topics_dir),
         "topic_files": topic_files,
+        "dedup_stats": {
+            "total_before": total_before,
+            "total_after": total_after,
+            "duplicate": dup_count,
+            "merge": merge_count,
+            "keep_both": keep_count,
+            "cross_topic_pairs": len(cross_pairs),
+        },
     }
     dump_json(intermediate_dir / "run_summary.json", summary_payload)
 
