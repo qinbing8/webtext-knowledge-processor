@@ -225,6 +225,12 @@ def parse_args() -> argparse.Namespace:
         default="all",
         help="只执行某个阶段（默认：all）",
     )
+    parser.add_argument(
+        "--full-resync",
+        action="store_true",
+        default=False,
+        help="强制全量重新合成（忽略增量缓存）",
+    )
     return parser.parse_args()
 
 
@@ -1353,6 +1359,20 @@ def call_llm_with_failover(
 _CONTINUATION_MAX_ROUNDS = 5
 _CONTINUATION_END_MARKER = "<!-- END -->"
 
+_MERGE_DEDUP_SYSTEM_PROMPT = """\
+你是专业文档去重合并工具。
+你将收到同一主题下两份已整理的知识文档。请合并为一份，消除重复内容。
+
+## 规则
+1. 完全重复的段落只保留一份（选择更完整的版本）
+2. 内容实质相同但表述不同的段落，合并为更完整的版本
+3. 独特内容必须全部保留
+4. 保持 ## 和 ### 层级结构
+5. 按逻辑顺序排列（基础概念 → 方法论 → 案例 → 进阶技巧）
+6. 保留优先级标注 [P0]/[P1]/[P2]
+7. 保留所有具体数据、书名、案例
+8. 输出完成后，必须在最后单独一行写 <!-- END --> 作为结束标记"""
+
 
 def call_llm_with_continuation(
     stage: StageConfig,
@@ -1552,9 +1572,114 @@ def _compute_topic_fingerprint(units: List[str]) -> str:
     return h.hexdigest()[:16]
 
 
+def _compute_unit_fingerprints(units: List[str]) -> List[str]:
+    """计算每条知识单元的独立指纹。"""
+    return [hashlib.sha256(u.encode("utf-8")).hexdigest()[:16] for u in units]
+
+
 def _save_topic_fingerprints(path: Path, merge_sig: str, fps: dict) -> None:
     """持久化 per-topic 指纹缓存。"""
     dump_json(path, {"merge_sig": merge_sig, "topics": fps})
+
+
+def _merge_reduce_sub_results(
+    sub_results: List[str],
+    topic_name: str,
+    merge_limit_kb: float,
+    stage: "StageConfig",
+    endpoint_states: List["EndpointState"],
+    runtime: "RuntimeConfig",
+    s_tag: str,
+    stop_event: threading.Event,
+    manifest_lock: threading.Lock,
+    consecutive_all_fail: List[int],
+    ALL_FAIL_THRESHOLD: int,
+) -> str:
+    """对子批结果做 pairwise merge-reduce 去重合并。
+
+    每轮将相邻两段合并（两段合计 ≤ merge_limit_kb），直到无法继续。
+    合并失败时保留两段原文（降级），EndpointsExhaustedError 则直接上抛。
+    """
+    items = list(sub_results)
+    round_no = 0
+
+    while len(items) > 1:
+        if stop_event.is_set():
+            break
+
+        next_items: List[str] = []
+        merged_any = False
+        idx = 0
+
+        while idx < len(items):
+            if stop_event.is_set():
+                next_items.extend(items[idx:])
+                break
+
+            if idx + 1 < len(items):
+                a, b = items[idx], items[idx + 1]
+                a_kb = len(a.encode("utf-8")) / 1024.0
+                b_kb = len(b.encode("utf-8")) / 1024.0
+
+                if a_kb + b_kb <= merge_limit_kb:
+                    merge_prompt = (
+                        f"以下是关于【{topic_name}】主题的两份已整理文档，请合并去重。\n\n"
+                        f"=== 文档 A ===\n{a}\n\n=== 文档 B ===\n{b}"
+                    )
+                    try:
+                        raw = call_llm_with_continuation(
+                            stage=stage,
+                            endpoint_states=endpoint_states,
+                            system_prompt=_MERGE_DEDUP_SYSTEM_PROMPT,
+                            user_prompt=merge_prompt,
+                            runtime=runtime,
+                        )
+                        merged = strip_code_fences(raw)
+                        next_items.append(merged)
+                        merged_any = True
+                        with manifest_lock:
+                            consecutive_all_fail[0] = 0
+                        merged_kb = len(merged.encode("utf-8")) / 1024.0
+                        print(
+                            f"[synthesize{s_tag}] 合并 round {round_no}: "
+                            f"{a_kb:.1f}KB + {b_kb:.1f}KB → {merged_kb:.1f}KB"
+                        )
+                    except EndpointsExhaustedError:
+                        raise
+                    except PipelineError as exc:
+                        with manifest_lock:
+                            consecutive_all_fail[0] += 1
+                            if consecutive_all_fail[0] >= ALL_FAIL_THRESHOLD:
+                                print(
+                                    f"[synthesize{s_tag}] 连续 {consecutive_all_fail[0]} "
+                                    f"轮全端点失败，触发熔断终止"
+                                )
+                                stop_event.set()
+                                raise EndpointsExhaustedError(
+                                    f"连续 {consecutive_all_fail[0]} 轮全端点调用失败，终止处理"
+                                ) from exc
+                        print(
+                            f"[synthesize{s_tag}] 合并失败 (round {round_no}): {exc}，保留两段原文"
+                        )
+                        next_items.append(a)
+                        next_items.append(b)
+                    idx += 2
+                else:
+                    # 两段合计超限，跳过
+                    next_items.append(a)
+                    idx += 1
+            else:
+                # 奇数个，最后一段直接保留
+                next_items.append(items[idx])
+                idx += 1
+
+        items = next_items
+        round_no += 1
+
+        if not merged_any:
+            break
+
+    return "\n\n---\n\n".join(items)
 
 
 def split_large_text(text: str, max_size_kb: float) -> List[str]:
@@ -2238,6 +2363,7 @@ def group_by_category(extract_dir: Path) -> Dict[str, List[str]]:
 def run_synthesize_stage(
     config: PipelineConfig,
     extract_dir: Path,
+    full_resync: bool = False,
 ) -> None:
     """Synthesize 阶段：按分类标签归组 → 标签合并 → 逐分类 LLM 合并去重。"""
 
@@ -2276,13 +2402,19 @@ def run_synthesize_stage(
 
     # ── per-topic 指纹缓存（增量模式：仅重做输入变化的主题） ──
     topic_fp_path = intermediate_dir / "synthesize_topic_fingerprints.json"
-    cached_topic_fps: dict[str, str] = {}
+    cached_topic_fps: dict[str, dict] = {}
     if topic_fp_path.is_file():
         try:
             fp_data = json.loads(topic_fp_path.read_text(encoding="utf-8"))
             # merge 配置变更 → 全部失效
             if fp_data.get("merge_sig") == merge_sig:
-                cached_topic_fps = fp_data.get("topics", {})
+                raw_topics = fp_data.get("topics", {})
+                for k, v in raw_topics.items():
+                    if isinstance(v, str):
+                        # 旧格式迁移: str → dict（无 unit_fps → delta 不可用）
+                        cached_topic_fps[k] = {"fingerprint": v, "unit_fps": []}
+                    elif isinstance(v, dict):
+                        cached_topic_fps[k] = v
         except (json.JSONDecodeError, KeyError):
             pass
 
@@ -2320,6 +2452,12 @@ def run_synthesize_stage(
         synth_cfg.max_batch_size_kb,
         config.synthesize_stage.provider,
         config.batching.provider_limits,
+    )
+    merge_limit = get_effective_size_limit(
+        synth_cfg.max_batch_size_kb,
+        config.synthesize_stage.provider,
+        config.batching.provider_limits,
+        safety_margin=0.90,  # 合并 pass 用 0.90（prompt 比合成简单）
     )
     synthesize_system_prompt = config.synthesize_stage.system_prompt
 
@@ -2368,12 +2506,69 @@ def run_synthesize_stage(
 
         # 增量缓存：主题输入未变则跳过
         current_fp = _compute_topic_fingerprint(units)
-        if (topic_name in cached_topic_fps and
-                cached_topic_fps[topic_name] == current_fp and
+        current_unit_fps = _compute_unit_fingerprints(units)
+        cached_entry = cached_topic_fps.get(topic_name, {})
+        cached_fp = cached_entry.get("fingerprint", "") if isinstance(cached_entry, dict) else cached_entry
+        cached_unit_fps = cached_entry.get("unit_fps", []) if isinstance(cached_entry, dict) else []
+
+        if (cached_fp == current_fp and
                 topic_path.is_file()):
             print(f"[synthesize{s_tag} {i}/{total}] {topic_name} (内容未变，跳过)")
             synth_clog.record(worker=worker_name, unit=topic_name, status="skip", duration_s=0.0)
             return filename
+
+        # ── Delta 增量合成 ──
+        current_unit_fps_set = set(current_unit_fps)
+        cached_unit_fps_set = set(cached_unit_fps)
+        new_unit_fps = current_unit_fps_set - cached_unit_fps_set
+        deleted_unit_fps = cached_unit_fps_set - current_unit_fps_set
+
+        if (not full_resync
+                and cached_unit_fps  # 有 unit_fps 缓存
+                and topic_path.is_file()  # 输出文件存在
+                and not deleted_unit_fps  # 无删除
+                and new_unit_fps  # 有新增
+                and len(new_unit_fps) <= len(current_unit_fps) * 0.5):  # 新增 ≤ 50%
+            # 找出新增的知识单元
+            new_units = [u for u, fp in zip(units, current_unit_fps) if fp in new_unit_fps]
+            delta_text = "\n\n---\n\n".join(new_units)
+            delta_kb = len(delta_text.encode("utf-8")) / 1024.0
+
+            if delta_kb <= effective_limit:
+                print(
+                    f"[synthesize{s_tag} {i}/{total}] {topic_name} "
+                    f"(Delta: {len(new_units)} 条新增, {delta_kb:.1f}KB)"
+                )
+                delta_prompt = (
+                    f"以下是关于【{topic_name}】这一主题的 {len(new_units)} 条新增知识单元，"
+                    f"来自不同来源的提取结果。请按规则合并整理，保留所有独特内容。\n\n"
+                    + delta_text
+                )
+                try:
+                    raw = call_llm_with_continuation(
+                        stage=config.synthesize_stage,
+                        endpoint_states=endpoint_states,
+                        system_prompt=synthesize_system_prompt,
+                        user_prompt=delta_prompt,
+                        runtime=config.runtime,
+                    )
+                    delta_result = strip_code_fences(raw)
+                    # 追加到已有输出文件末尾
+                    existing_text = topic_path.read_text(encoding="utf-8")
+                    merged_text = existing_text + "\n\n---\n\n" + delta_result
+                    topic_path.write_text(merged_text, encoding="utf-8")
+                    merged_kb = len(merged_text.encode("utf-8")) / 1024.0
+                    print(f"[synthesize{s_tag}] → Delta 追加: {filename} ({merged_kb:.1f}KB)")
+                    with manifest_lock:
+                        consecutive_all_fail[0] = 0
+                        cached_topic_fps[topic_name] = {"fingerprint": current_fp, "unit_fps": current_unit_fps}
+                        _save_topic_fingerprints(topic_fp_path, merge_sig, cached_topic_fps)
+                    synth_clog.record(worker=worker_name, unit=topic_name, status="ok", duration_s=time.time() - t0)
+                    return filename
+                except PipelineError:
+                    print(f"[synthesize{s_tag}] Delta 合成失败，回退全量")
+            else:
+                print(f"[synthesize{s_tag}] Delta 过大 ({delta_kb:.1f}KB)，回退全量")
 
         print(f"[synthesize{s_tag} {i}/{total}] {topic_name} ({len(units)} 条, {combined_kb:.1f}KB)")
 
@@ -2381,7 +2576,7 @@ def run_synthesize_stage(
             print(f"[synthesize{s_tag}] → 仅 1 条，直接写入: {filename}")
             topic_path.write_text(units[0], encoding="utf-8")
             with manifest_lock:
-                cached_topic_fps[topic_name] = current_fp
+                cached_topic_fps[topic_name] = {"fingerprint": current_fp, "unit_fps": current_unit_fps}
                 _save_topic_fingerprints(topic_fp_path, merge_sig, cached_topic_fps)
             synth_clog.record(worker=worker_name, unit=topic_name, status="ok", duration_s=time.time() - t0)
             return filename
@@ -2458,7 +2653,16 @@ def run_synthesize_stage(
                         print(f"[synthesize{s_tag}]   子批 {si} 失败: {exc}，保留原文")
                         sub_results.append(sub_text)
 
-                final_text = "\n\n---\n\n".join(sub_results)
+                if len(sub_results) > 1:
+                    print(f"[synthesize{s_tag}] 跨批去重合并 ({len(sub_results)} 段)...")
+                    final_text = _merge_reduce_sub_results(
+                        sub_results, topic_name, merge_limit,
+                        config.synthesize_stage, endpoint_states, config.runtime,
+                        s_tag, stop_event, manifest_lock,
+                        consecutive_all_fail, ALL_FAIL_THRESHOLD,
+                    )
+                else:
+                    final_text = sub_results[0] if sub_results else ""
                 topic_path.write_text(final_text, encoding="utf-8")
                 final_kb = len(final_text.encode("utf-8")) / 1024.0
                 print(f"[synthesize{s_tag}] → {filename} ({final_kb:.1f}KB)")
@@ -2484,7 +2688,7 @@ def run_synthesize_stage(
             print(f"[synthesize{s_tag}] → 降级为原文拼接: {filename}")
 
         with manifest_lock:
-            cached_topic_fps[topic_name] = current_fp
+            cached_topic_fps[topic_name] = {"fingerprint": current_fp, "unit_fps": current_unit_fps}
             _save_topic_fingerprints(topic_fp_path, merge_sig, cached_topic_fps)
         return filename
 
@@ -2673,7 +2877,7 @@ def _fmt_endpoints(stage: StageConfig) -> str:
     return stage.api_url or "default"
 
 
-def run_pipeline(config: PipelineConfig, only_stage: str) -> None:
+def run_pipeline(config: PipelineConfig, only_stage: str, full_resync: bool = False) -> None:
     config.output_dir.mkdir(parents=True, exist_ok=True)
 
     print("[pipeline] 配置加载完成")
@@ -2696,7 +2900,7 @@ def run_pipeline(config: PipelineConfig, only_stage: str) -> None:
     if only_stage in {"all", "synthesize"}:
         if extract_dir is None:
             extract_dir = get_intermediate_extract_dir(config.output_dir)
-        run_synthesize_stage(config, extract_dir)
+        run_synthesize_stage(config, extract_dir, full_resync)
 
 
 def resolve_error_log_dir(config_path: Path, config: PipelineConfig | None) -> Path:
@@ -2739,7 +2943,7 @@ def main() -> None:
 
     try:
         config = load_config(config_path)
-        run_pipeline(config, args.only_stage)
+        run_pipeline(config, args.only_stage, args.full_resync)
         print("[pipeline] 全部执行完成")
     except KeyboardInterrupt as exc:
         log_dir = resolve_error_log_dir(config_path, config)
