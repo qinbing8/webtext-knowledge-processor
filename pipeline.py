@@ -213,8 +213,6 @@ class SimilarityConfig:
 
 @dataclass(frozen=True)
 class SynthesizeMergeConfig:
-    target_categories: int = 15
-    use_llm: bool = True
     mapping: Dict[str, List[str]] = field(default_factory=dict)
     similarity: SimilarityConfig = field(default_factory=SimilarityConfig)
 
@@ -337,16 +335,26 @@ def load_config(config_path: Path) -> PipelineConfig:
 
     # ── 解析 synthesize.similarity 配置 ──
     similarity_raw = synthesize_raw.get("similarity", {}) or {}
+    sim_threshold = float(similarity_raw.get("threshold", 0.70))
+    sim_ngram = int(similarity_raw.get("ngram_size", 3))
+    sim_batch = int(similarity_raw.get("llm_batch_size", 8))
+    sim_max_kb = int(similarity_raw.get("max_file_size_kb", 100))
+    if not (0 < sim_threshold <= 1):
+        raise PipelineError(f"similarity.threshold 必须在 (0, 1] 范围内，当前值: {sim_threshold}")
+    if sim_ngram < 2:
+        raise PipelineError(f"similarity.ngram_size 必须 >= 2，当前值: {sim_ngram}")
+    if sim_batch < 1:
+        raise PipelineError(f"similarity.llm_batch_size 必须 >= 1，当前值: {sim_batch}")
+    if sim_max_kb < 1:
+        raise PipelineError(f"similarity.max_file_size_kb 必须 >= 1，当前值: {sim_max_kb}")
     similarity_config = SimilarityConfig(
-        threshold=float(similarity_raw.get("threshold", 0.70)),
-        ngram_size=int(similarity_raw.get("ngram_size", 3)),
-        llm_batch_size=int(similarity_raw.get("llm_batch_size", 8)),
-        max_file_size_kb=int(similarity_raw.get("max_file_size_kb", 100)),
+        threshold=sim_threshold,
+        ngram_size=sim_ngram,
+        llm_batch_size=sim_batch,
+        max_file_size_kb=sim_max_kb,
     )
 
     merge_config = SynthesizeMergeConfig(
-        target_categories=int(grouping_raw.get("target_categories", 15)),
-        use_llm=bool(grouping_raw.get("use_llm", True)),
         mapping=grouping_mapping,
         similarity=similarity_config,
     )
@@ -2640,34 +2648,40 @@ def apply_dedup_verdicts(
     # 收集需要删除的指纹和需要替换的指纹
     drop_fps: set = set()
     replacements: Dict[str, KnowledgeUnit] = {}  # fp → replacement unit
+    merge_involved_fps: set = set()  # 参与 MERGE 的所有 fp
 
     for pair_key, judgment in judgments.items():
         verdict = judgment.get("verdict", "KEEP_BOTH")
-        if verdict == "DUPLICATE":
-            drop_fp = judgment.get("drop", "")
-            if drop_fp:
-                drop_fps.add(drop_fp)
-        elif verdict == "MERGE":
+        if verdict == "MERGE":
             merged_text = judgment.get("merged_text", "")
             if merged_text:
                 fps = pair_key.split("_")
                 if len(fps) == 2:
-                    # 两条都删除，用合并版替代第一条
-                    drop_fps.add(fps[1])
-                    keep_fp = fps[0]
-                    # 从现有单元中找到 keep 的元信息
+                    merge_involved_fps.update(fps)
+                    # 找到两条原始单元，取优先级更高（数值更小）的元信息
+                    candidates: List[KnowledgeUnit] = []
                     for units in topic_units.values():
                         for u in units:
-                            if u.fingerprint == keep_fp:
-                                new_fp = hashlib.sha256(merged_text.encode("utf-8")).hexdigest()[:16]
-                                replacements[keep_fp] = KnowledgeUnit(
-                                    tag=u.tag,
-                                    priority=u.priority,
-                                    title=u.title,
-                                    body=merged_text,
-                                    fingerprint=new_fp,
-                                )
-                                break
+                            if u.fingerprint in fps:
+                                candidates.append(u)
+                    if candidates:
+                        best = min(candidates, key=lambda x: x.priority)
+                        new_fp = hashlib.sha256(merged_text.encode("utf-8")).hexdigest()[:16]
+                        keep_fp = fps[0]
+                        drop_fps.add(fps[1])
+                        replacements[keep_fp] = KnowledgeUnit(
+                            tag=best.tag,
+                            priority=best.priority,
+                            title=best.title,
+                            body=merged_text,
+                            fingerprint=new_fp,
+                        )
+        elif verdict == "DUPLICATE":
+            drop_fp = judgment.get("drop", "")
+            if drop_fp:
+                # MERGE 优先：如果该 fp 已被 MERGE 处理，则忽略 DUPLICATE
+                if drop_fp not in merge_involved_fps:
+                    drop_fps.add(drop_fp)
 
     result: Dict[str, List[KnowledgeUnit]] = {}
     for topic_name, units in topic_units.items():
@@ -2685,6 +2699,18 @@ def apply_dedup_verdicts(
     return result
 
 
+def _atomic_write(path: Path, content: str) -> None:
+    """原子写入：先写临时文件，再 os.replace 到目标路径。"""
+    tmp_path = path.with_suffix(".tmp")
+    try:
+        tmp_path.write_text(content, encoding="utf-8")
+        os.replace(str(tmp_path), str(path))
+    except BaseException:
+        if tmp_path.exists():
+            tmp_path.unlink()
+        raise
+
+
 def write_topic_files(
     topic_units: Dict[str, List[KnowledgeUnit]],
     topics_dir: Path,
@@ -2700,6 +2726,8 @@ def write_topic_files(
     for topic_name, units in sorted(topic_units.items(), key=lambda kv: (kv[0] == "未分类", kv[0])):
         if not units:
             continue
+
+        safe_name = safe_filename(topic_name)
 
         # 计算内容指纹
         content_fp = hashlib.sha256(
@@ -2721,15 +2749,16 @@ def write_topic_files(
         full_bytes = len(full_text.encode("utf-8"))
         max_bytes = max_kb * 1024
 
-        # 清理该主题的旧文件
-        base_name = f"{topic_name}.md"
-        for old_file in topics_dir.glob(f"{topic_name}*.md"):
-            old_file.unlink()
+        # 清理该主题的旧文件（精确匹配：base.md + base-NNN.md）
+        base_name = f"{safe_name}.md"
+        for pattern in [f"{safe_name}.md", f"{safe_name}-*.md"]:
+            for old_file in topics_dir.glob(pattern):
+                old_file.unlink()
 
         if full_bytes <= max_bytes:
             # 单文件
             file_path = topics_dir / base_name
-            file_path.write_text(full_text, encoding="utf-8")
+            _atomic_write(file_path, full_text)
             written_files.append(base_name)
             topic_fp_cache[topic_name] = {"fingerprint": content_fp, "files": [base_name]}
             print(f"[synthesize] → {base_name} ({full_bytes / 1024:.1f}KB)")
@@ -2744,9 +2773,9 @@ def write_topic_files(
                 u_bytes = len(u.body.encode("utf-8"))
                 if current_parts and current_size + u_bytes + 2 > max_bytes:
                     # 写入当前卷
-                    vol_name = base_name if vol_num == 1 else f"{topic_name}-{vol_num:03d}.md"
+                    vol_name = base_name if vol_num == 1 else f"{safe_name}-{vol_num:03d}.md"
                     vol_path = topics_dir / vol_name
-                    vol_path.write_text("\n\n".join(current_parts), encoding="utf-8")
+                    _atomic_write(vol_path, "\n\n".join(current_parts))
                     volume_files.append(vol_name)
                     print(f"[synthesize] → {vol_name} ({current_size / 1024:.1f}KB)")
                     current_parts = []
@@ -2757,9 +2786,9 @@ def write_topic_files(
                 current_size += u_bytes + 2
 
             if current_parts:
-                vol_name = base_name if vol_num == 1 else f"{topic_name}-{vol_num:03d}.md"
+                vol_name = base_name if vol_num == 1 else f"{safe_name}-{vol_num:03d}.md"
                 vol_path = topics_dir / vol_name
-                vol_path.write_text("\n\n".join(current_parts), encoding="utf-8")
+                _atomic_write(vol_path, "\n\n".join(current_parts))
                 volume_files.append(vol_name)
                 print(f"[synthesize] → {vol_name} ({current_size / 1024:.1f}KB)")
 
@@ -3097,16 +3126,15 @@ def run_synthesize_stage(
     print(f"[synthesize] Phase 5: 写入主题文件 (分卷阈值: {sim_cfg.max_file_size_kb}KB)...")
 
     # 清理 topics 目录中不属于当前 mapping 的旧文件
-    valid_prefixes = set()
-    for topic_name in deduped_units:
-        valid_prefixes.add(topic_name)
+    valid_safe_names = {safe_filename(tn) for tn in deduped_units}
     for old_file in topics_dir.glob("*.md"):
         if old_file.name == "00-目录与导读.md":
             continue
-        # 检查文件是否属于当前有效主题
+        # 检查文件是否属于当前有效主题（精确匹配 safe_name.md 或 safe_name-NNN.md）
+        stem = old_file.stem  # e.g. "01-入门认知篇" or "01-入门认知篇-002"
         belongs = False
-        for prefix in valid_prefixes:
-            if old_file.name.startswith(prefix):
+        for sn in valid_safe_names:
+            if stem == sn or (stem.startswith(sn + "-") and stem[len(sn) + 1:].isdigit()):
                 belongs = True
                 break
         if not belongs:
@@ -3156,107 +3184,6 @@ def run_synthesize_stage(
     dump_json(intermediate_dir / "run_summary.json", summary_payload)
 
     print(f"[synthesize] 阶段完成，共 {len(topic_files)} 个主题文件，目录：{topics_dir}")
-
-
-# ── 标签合并工具 ──
-
-
-def _build_grouping_prompt(tag_names: List[str], target_count: int) -> str:
-    """构建 LLM 分组提示词：输入标签名列表，输出分组 JSON。"""
-    names_text = "\n".join(f"- {n}" for n in tag_names)
-    return (
-        f"以下是 {len(tag_names)} 个网文写作知识标签名称：\n\n"
-        f"{names_text}\n\n"
-        f"请将它们分为约 {target_count} 个大分类，每个分类包含内容相关的标签。\n\n"
-        f"分类原则：\n"
-        f"1. 内容高度相关的标签归为同一类\n"
-        f"2. 每个分类至少包含 2 个标签\n"
-        f"3. 分类名应简洁概括（如「角色塑造与代入感」「剧情结构与节奏」）\n"
-        f"4. 每个标签只能出现在一个分类中\n"
-        f"5. 所有标签都必须被分配到某个分类\n\n"
-        f"请直接输出 JSON，格式如下（不要输出其他内容）：\n"
-        f'{{"分类名1": ["标签A", "标签B"], "分类名2": ["标签C", "标签D"]}}'
-    )
-
-
-def _resolve_tag_mapping(
-    tag_names: List[str],
-    merge_config: SynthesizeMergeConfig,
-    stage: StageConfig,
-    endpoint_states: List[EndpointState],
-    runtime: RuntimeConfig,
-) -> Dict[str, List[str]]:
-    """解析标签 → 大分类映射。手动映射优先，否则走 LLM。"""
-    if merge_config.mapping:
-        print("[synthesize] 使用手动标签映射")
-        return merge_config.mapping
-
-    if not merge_config.use_llm:
-        print("[synthesize] use_llm=false 且无手动映射，每个标签独立成类")
-        return {name: [name] for name in tag_names}
-
-    print("[synthesize] 使用 LLM 自动分组标签...")
-    prompt = _build_grouping_prompt(tag_names, merge_config.target_categories)
-    try:
-        raw = call_llm_with_failover(
-            stage=stage,
-            endpoint_states=endpoint_states,
-            system_prompt="你是一个分类专家。请严格按要求输出 JSON。",
-            user_prompt=prompt,
-            runtime=runtime,
-        )
-        mapping: Dict[str, List[str]] = _repair_json(raw)
-        if not isinstance(mapping, dict):
-            raise PipelineError("LLM 标签分组返回的不是 JSON 对象")
-    except PipelineError as exc:
-        print(f"[synthesize] LLM 标签分组失败: {exc}，降级为每标签独立成类")
-        return {name: [name] for name in tag_names}
-
-    # 限制分类数
-    if len(mapping) > merge_config.target_categories * 2:
-        print(
-            f"[synthesize] 警告：LLM 返回 {len(mapping)} 个分类，"
-            f"超过目标 {merge_config.target_categories} 的两倍"
-        )
-
-    return mapping
-
-
-def _apply_tag_grouping(
-    buckets: Dict[str, List[str]],
-    mapping: Dict[str, List[str]],
-) -> Dict[str, List[str]]:
-    """按 mapping 合并 buckets。未映射标签归入「未分类」。"""
-    # 构建 tag → category 反向索引（去重）
-    tag_to_category: Dict[str, str] = {}
-    for category, tags in mapping.items():
-        seen: set[str] = set()
-        for tag in tags:
-            tag = tag.strip()
-            if not tag or tag in seen:
-                continue
-            seen.add(tag)
-            if tag in tag_to_category:
-                print(
-                    f"[synthesize] 警告：标签 '{tag}' 重复映射"
-                    f"（'{tag_to_category[tag]}' vs '{category}'），保留首次")
-                continue
-            tag_to_category[tag] = category
-
-    # 检查映射中引用但不存在的标签
-    all_bucket_tags = set(buckets.keys())
-    for category, tags in mapping.items():
-        for tag in tags:
-            tag = tag.strip()
-            if tag and tag not in all_bucket_tags:
-                print(f"[synthesize] 警告：映射中标签 '{tag}' 不存在于实际标签集，跳过")
-
-    merged: Dict[str, List[str]] = {}
-    for tag_name, units in buckets.items():
-        category = tag_to_category.get(tag_name, "未分类")
-        merged.setdefault(category, []).extend(units)
-
-    return merged
 
 
 
