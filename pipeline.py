@@ -2387,7 +2387,7 @@ def run_synthesize_stage(
     ).hexdigest()[:16]
     current_fingerprint = f"{extract_fp}_{merge_sig}"
 
-    if fingerprint_path.is_file() and manifest_path.is_file():
+    if not full_resync and fingerprint_path.is_file() and manifest_path.is_file():
         stored_fp = fingerprint_path.read_text(encoding="utf-8").strip()
         if stored_fp == current_fingerprint:
             try:
