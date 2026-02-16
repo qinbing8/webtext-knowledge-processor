@@ -18,6 +18,8 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Tuple
 from urllib import error, parse, request
 
+import numpy as np
+
 
 IGNORED_DIR_NAMES = {
     ".venv",
@@ -209,6 +211,11 @@ class SimilarityConfig:
     ngram_size: int = 3
     llm_batch_size: int = 8
     max_file_size_kb: int = 100
+    method: str = "embedding"              # "embedding" | "ngram"
+    embedding_model: str = "text-embedding-3-small"
+    embedding_batch_size: int = 100
+    embedding_api_url: str = ""            # 可选：独立 embedding 端点 URL
+    embedding_api_key: str = ""            # 可选：独立 embedding 端点 Key
 
 
 @dataclass(frozen=True)
@@ -339,6 +346,13 @@ def load_config(config_path: Path) -> PipelineConfig:
     sim_ngram = int(similarity_raw.get("ngram_size", 3))
     sim_batch = int(similarity_raw.get("llm_batch_size", 8))
     sim_max_kb = int(similarity_raw.get("max_file_size_kb", 100))
+    sim_method = str(similarity_raw.get("method", "embedding")).strip().lower()
+    sim_embedding_model = str(similarity_raw.get("embedding_model", "text-embedding-3-small")).strip()
+    sim_embedding_batch = int(similarity_raw.get("embedding_batch_size", 100))
+    # 可选独立 embedding 端点
+    emb_endpoint_raw = similarity_raw.get("embedding_endpoint", {}) or {}
+    sim_emb_api_url = str(emb_endpoint_raw.get("api_url", "")).strip()
+    sim_emb_api_key = str(emb_endpoint_raw.get("api_key", "")).strip()
     if not (0 < sim_threshold <= 1):
         raise PipelineError(f"similarity.threshold 必须在 (0, 1] 范围内，当前值: {sim_threshold}")
     if sim_ngram < 2:
@@ -347,11 +361,20 @@ def load_config(config_path: Path) -> PipelineConfig:
         raise PipelineError(f"similarity.llm_batch_size 必须 >= 1，当前值: {sim_batch}")
     if sim_max_kb < 1:
         raise PipelineError(f"similarity.max_file_size_kb 必须 >= 1，当前值: {sim_max_kb}")
+    if sim_method not in ("embedding", "ngram"):
+        raise PipelineError(f"similarity.method 必须为 'embedding' 或 'ngram'，当前值: {sim_method!r}")
+    if sim_embedding_batch < 1:
+        raise PipelineError(f"similarity.embedding_batch_size 必须 >= 1，当前值: {sim_embedding_batch}")
     similarity_config = SimilarityConfig(
         threshold=sim_threshold,
         ngram_size=sim_ngram,
         llm_batch_size=sim_batch,
         max_file_size_kb=sim_max_kb,
+        method=sim_method,
+        embedding_model=sim_embedding_model,
+        embedding_batch_size=sim_embedding_batch,
+        embedding_api_url=sim_emb_api_url,
+        embedding_api_key=sim_emb_api_key,
     )
 
     merge_config = SynthesizeMergeConfig(
@@ -2490,6 +2513,248 @@ def apply_topic_mapping(
     return topic_buckets, unmapped_tags
 
 
+# ── Embedding 向量语义去重 ──
+
+
+def _embedding_url_from_chat_url(chat_url: str) -> str:
+    """将 /chat/completions 端点 URL 转换为 /embeddings 端点 URL。"""
+    url = chat_url.rstrip("/")
+    for suffix in ("/chat/completions", "/responses"):
+        if url.endswith(suffix):
+            return url[: -len(suffix)] + "/embeddings"
+    # 如果 URL 不是标准格式，直接追加 /embeddings
+    return url + "/embeddings"
+
+
+def _get_embeddings(
+    texts: List[str],
+    config: PipelineConfig,
+    endpoint_states: List["EndpointState"],
+    sim_cfg: "SimilarityConfig",
+) -> List[List[float]]:
+    """批量获取文本 embedding 向量。
+
+    优先使用 sim_cfg 中配置的独立 embedding 端点（embedding_api_url）；
+    若未配置则 fallback 到 synthesize 端点（将 /chat/completions 替换为 /embeddings）。
+    返回与输入同序的向量列表。
+    """
+    model = sim_cfg.embedding_model
+    batch_size = sim_cfg.embedding_batch_size
+    use_dedicated = bool(sim_cfg.embedding_api_url)
+
+    all_vectors: List[List[float]] = [[] for _ in range(len(texts))]
+
+    for batch_start in range(0, len(texts), batch_size):
+        batch_texts = texts[batch_start: batch_start + batch_size]
+        batch_indices = list(range(batch_start, batch_start + len(batch_texts)))
+
+        payload = {
+            "model": model,
+            "input": batch_texts,
+        }
+
+        def _parse_embedding_response(resp: dict) -> List[List[float]]:
+            data = resp.get("data", [])
+            if not isinstance(data, list) or len(data) != len(batch_texts):
+                raise PipelineError(
+                    f"Embedding 响应格式异常: 期望 {len(batch_texts)} 条, "
+                    f"实际 {len(data) if isinstance(data, list) else 'N/A'}"
+                )
+            sorted_data = sorted(data, key=lambda d: d.get("index", 0))
+            return [item.get("embedding", []) for item in sorted_data]
+
+        if use_dedicated:
+            # 独立 embedding 端点：直接调用，不走 failover
+            try:
+                resp = post_json(
+                    url=sim_cfg.embedding_api_url,
+                    headers={"Authorization": f"Bearer {sim_cfg.embedding_api_key}"},
+                    payload=payload,
+                    runtime=config.runtime,
+                )
+                vectors = _parse_embedding_response(resp)
+                for i, vec in enumerate(vectors):
+                    all_vectors[batch_indices[i]] = vec
+            except PipelineError as exc:
+                raise PipelineError(
+                    f"Embedding 批次 {batch_start}-{batch_start + len(batch_texts)} "
+                    f"独立端点失败: {exc}"
+                ) from exc
+        else:
+            # Fallback：遍历 synthesize 端点
+            available = [es for es in endpoint_states if es.is_available()]
+            if not available:
+                raise EndpointsExhaustedError("所有端点均已熔断，无法获取 embedding")
+
+            success = False
+            for es in available:
+                ep = es.endpoint
+                embedding_url = _embedding_url_from_chat_url(ep.api_url)
+                payload["model"] = ep.model if ep.model else model
+                try:
+                    resp = post_json(
+                        url=embedding_url,
+                        headers={"Authorization": f"Bearer {ep.api_key}"},
+                        payload=payload,
+                        runtime=config.runtime,
+                    )
+                    es.record_success()
+                    vectors = _parse_embedding_response(resp)
+                    for i, vec in enumerate(vectors):
+                        all_vectors[batch_indices[i]] = vec
+                    success = True
+                    break
+                except (PipelineError, EndpointsExhaustedError) as exc:
+                    es.record_failure(error_msg=str(exc))
+                    print(f"[embedding] 端点 '{es.name}' 失败: {exc}")
+                    continue
+
+            if not success:
+                raise PipelineError(
+                    f"Embedding 批次 {batch_start}-{batch_start + len(batch_texts)} 所有端点均失败"
+                )
+
+        if batch_start + batch_size < len(texts):
+            done = min(batch_start + batch_size, len(texts))
+            print(f"[embedding] 进度: {done}/{len(texts)}")
+
+    return all_vectors
+
+
+def _load_embedding_cache(cache_path: Path) -> Dict[str, List[float]]:
+    """加载 embedding 缓存。key = unit fingerprint, value = vector。"""
+    if not cache_path.is_file():
+        return {}
+    try:
+        data = json.loads(cache_path.read_text(encoding="utf-8"))
+        if isinstance(data, dict):
+            return data
+    except (json.JSONDecodeError, OSError):
+        pass
+    return {}
+
+
+def _save_embedding_cache(cache_path: Path, cache: Dict[str, List[float]]) -> None:
+    """保存 embedding 缓存（原子写入：写临时文件再 rename）。"""
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = cache_path.with_suffix(".tmp")
+    text = json.dumps(cache, ensure_ascii=False)
+    tmp_path.write_text(text, encoding="utf-8")
+    tmp_path.replace(cache_path)
+
+
+def _cosine_matrix(vecs_a: np.ndarray, vecs_b: np.ndarray) -> np.ndarray:
+    """计算两组向量的余弦相似度矩阵。
+
+    输入: vecs_a (M, D), vecs_b (N, D)
+    输出: (M, N) 余弦相似度矩阵
+    """
+    norms_a = np.linalg.norm(vecs_a, axis=1, keepdims=True)
+    norms_b = np.linalg.norm(vecs_b, axis=1, keepdims=True)
+    # 避免除零
+    norms_a = np.maximum(norms_a, 1e-10)
+    norms_b = np.maximum(norms_b, 1e-10)
+    a_norm = vecs_a / norms_a
+    b_norm = vecs_b / norms_b
+    return a_norm @ b_norm.T
+
+
+def scan_similarity_embedding(
+    topic_units: Dict[str, List[KnowledgeUnit]],
+    all_units: List[KnowledgeUnit],
+    cached_fps: set,
+    threshold: float,
+    embeddings: Dict[str, List[float]],
+) -> tuple[List[tuple[KnowledgeUnit, KnowledgeUnit, float]],
+           List[tuple[KnowledgeUnit, KnowledgeUnit, float]]]:
+    """Embedding 余弦相似度扫描。
+
+    返回值与 scan_similarity() 相同:
+    - intra_pairs: 同主题内超阈值的对（送 LLM）
+    - cross_pairs: 跨主题超阈值的对（仅报告）
+    """
+    intra_pairs: List[tuple[KnowledgeUnit, KnowledgeUnit, float]] = []
+    cross_pairs: List[tuple[KnowledgeUnit, KnowledgeUnit, float]] = []
+
+    # 识别新增单元
+    new_fps = {u.fingerprint for u in all_units} - cached_fps
+
+    # 同主题内扫描：新↔新 + 新↔旧
+    total_intra_comparisons = 0
+    for topic_name, units in topic_units.items():
+        # 过滤掉没有 embedding 的单元
+        units_with_emb = [u for u in units if u.fingerprint in embeddings]
+        new_in_topic = [u for u in units_with_emb if u.fingerprint in new_fps]
+        old_in_topic = [u for u in units_with_emb if u.fingerprint not in new_fps]
+
+        if not new_in_topic:
+            continue
+
+        # 新↔新 扫描
+        if len(new_in_topic) >= 2:
+            vecs = np.array([embeddings[u.fingerprint] for u in new_in_topic], dtype=np.float32)
+            sim_matrix = _cosine_matrix(vecs, vecs)
+            n = len(new_in_topic)
+            total_intra_comparisons += n * (n - 1) // 2
+            for i in range(n):
+                for j in range(i + 1, n):
+                    sim = float(sim_matrix[i, j])
+                    if sim >= threshold:
+                        intra_pairs.append((new_in_topic[i], new_in_topic[j], sim))
+
+        # 新↔旧 扫描
+        if new_in_topic and old_in_topic:
+            new_vecs = np.array([embeddings[u.fingerprint] for u in new_in_topic], dtype=np.float32)
+            old_vecs = np.array([embeddings[u.fingerprint] for u in old_in_topic], dtype=np.float32)
+            sim_matrix = _cosine_matrix(new_vecs, old_vecs)
+            total_intra_comparisons += len(new_in_topic) * len(old_in_topic)
+            for i in range(len(new_in_topic)):
+                for j in range(len(old_in_topic)):
+                    sim = float(sim_matrix[i, j])
+                    if sim >= threshold:
+                        intra_pairs.append((new_in_topic[i], old_in_topic[j], sim))
+
+        if new_in_topic or old_in_topic:
+            pairs_checked = (
+                len(new_in_topic) * (len(new_in_topic) - 1) // 2
+                + len(new_in_topic) * len(old_in_topic)
+            )
+            if pairs_checked > 0:
+                print(f"[synthesize] 扫描 {topic_name}: {len(new_in_topic)} 新 × {len(old_in_topic)} 旧 = {pairs_checked} 对")
+
+    print(f"[synthesize] 同主题扫描完成: {total_intra_comparisons} 次比较, {len(intra_pairs)} 对超过阈值")
+
+    # 跨主题扫描：仅对新单元采样（限制计算量）
+    CROSS_TOPIC_SAMPLE = 50
+    topic_names = list(topic_units.keys())
+    cross_comparisons = 0
+
+    for ti in range(len(topic_names)):
+        for tj in range(ti + 1, len(topic_names)):
+            units_a = topic_units[topic_names[ti]]
+            units_b = topic_units[topic_names[tj]]
+            new_a = [u for u in units_a if u.fingerprint in new_fps and u.fingerprint in embeddings][:CROSS_TOPIC_SAMPLE]
+            new_b = [u for u in units_b if u.fingerprint in new_fps and u.fingerprint in embeddings][:CROSS_TOPIC_SAMPLE]
+
+            if not new_a or not new_b:
+                continue
+
+            vecs_a = np.array([embeddings[u.fingerprint] for u in new_a], dtype=np.float32)
+            vecs_b = np.array([embeddings[u.fingerprint] for u in new_b], dtype=np.float32)
+            sim_matrix = _cosine_matrix(vecs_a, vecs_b)
+            cross_comparisons += len(new_a) * len(new_b)
+
+            for i in range(len(new_a)):
+                for j in range(len(new_b)):
+                    sim = float(sim_matrix[i, j])
+                    if sim >= threshold:
+                        cross_pairs.append((new_a[i], new_b[j], sim))
+
+    print(f"[synthesize] 跨主题扫描完成: {cross_comparisons} 次比较, {len(cross_pairs)} 对超过阈值")
+
+    return intra_pairs, cross_pairs
+
+
 def ngram_jaccard(text_a: str, text_b: str, n: int = 3) -> float:
     """计算两段文本的字符级 n-gram Jaccard 相似度。"""
     def ngrams(text: str, n: int) -> set:
@@ -2614,30 +2879,86 @@ def scan_similarity(
 
 
 def build_dedup_prompt(pairs: List[tuple[KnowledgeUnit, KnowledgeUnit, float]]) -> str:
-    """构建批量 LLM 判断 prompt。"""
+    """构建批量 verdict 判断 prompt（仅判定，不合并）。"""
     lines = [
-        "请判断以下知识单元对是否重复。对每一对回答 DUPLICATE / MERGE / KEEP_BOTH。\n"
-        "- DUPLICATE：完全重复，给出保留哪条（优先保留 P0）\n"
-        "- MERGE：部分重复有互补内容，给出合并后的完整版本\n"
+        "请判断以下知识单元对是否重复。\n"
+        "- DUPLICATE：完全重复，指出保留 A 还是 B（优先保留 P0）\n"
+        "- MERGE：部分重复有互补内容，需要后续合并\n"
         "- KEEP_BOTH：不重复，各有独特价值\n"
+        "\n请严格按以下格式输出，每对一行，不要输出其他内容：\n"
+        "对号|判定|保留侧\n"
+        "示例：\n"
+        "1|KEEP_BOTH\n"
+        "2|DUPLICATE|A\n"
+        "3|MERGE\n"
     ]
     for idx, (a, b, sim) in enumerate(pairs, 1):
         lines.append(f"\n【对{idx}】（相似度: {sim:.0%}）")
         lines.append(f"A (P{a.priority}): [{a.tag}] {a.title}")
-        # 限制展示的 body 长度（每条最多 2000 字符）
         body_a = a.body[:2000] + ("..." if len(a.body) > 2000 else "")
         body_b = b.body[:2000] + ("..." if len(b.body) > 2000 else "")
         lines.append(body_a)
         lines.append(f"\nB (P{b.priority}): [{b.tag}] {b.title}")
         lines.append(body_b)
 
-    lines.append(
-        "\n请用 JSON 数组格式回答：\n"
-        '[{"pair": 1, "verdict": "DUPLICATE", "keep": "A"}, '
-        '{"pair": 2, "verdict": "MERGE", "merged_text": "合并后完整文本..."}, '
-        '{"pair": 3, "verdict": "KEEP_BOTH"}]'
-    )
     return "\n".join(lines)
+
+
+def _parse_verdicts(
+    raw: str, num_pairs: int,
+) -> List[dict]:
+    """解析 verdict 批量输出。
+
+    期望格式：每行 '对号|判定' 或 '对号|判定|保留侧'。
+    兼容各种分隔符（| : 空格 制表符）和 LLM 可能附加的文字。
+    返回列表，索引 = pair_idx (0-based)，值 = {"verdict": ..., "keep": ...}。
+    """
+    results: List[dict] = [{"verdict": "KEEP_BOTH"} for _ in range(num_pairs)]
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line or not line[0].isdigit():
+            continue
+        # 统一分隔符
+        normalized = re.sub(r'[\|\:\t]+', '|', line)
+        parts = [p.strip() for p in normalized.split('|') if p.strip()]
+        if len(parts) < 2:
+            continue
+        try:
+            pair_num = int(re.match(r'\d+', parts[0]).group())  # type: ignore[union-attr]
+        except (ValueError, AttributeError):
+            continue
+        idx = pair_num - 1
+        if not (0 <= idx < num_pairs):
+            continue
+        verdict = parts[1].upper()
+        if verdict not in ("DUPLICATE", "MERGE", "KEEP_BOTH"):
+            # 容错：包含关键词即可
+            if "DUPLICATE" in verdict or "DUP" in verdict:
+                verdict = "DUPLICATE"
+            elif "MERGE" in verdict:
+                verdict = "MERGE"
+            else:
+                verdict = "KEEP_BOTH"
+        entry: dict = {"verdict": verdict}
+        if verdict == "DUPLICATE" and len(parts) >= 3:
+            keep_side = parts[2].upper().strip()
+            if keep_side in ("A", "B"):
+                entry["keep"] = keep_side
+        results[idx] = entry
+    return results
+
+
+def build_merge_prompt(a: KnowledgeUnit, b: KnowledgeUnit, sim: float) -> str:
+    """构建单对合并 prompt，要求 LLM 返回合并后的 Markdown 文本。"""
+    return (
+        "请将以下两条知识单元合并为一条，保留双方独特内容，消除重复部分。\n"
+        "输出要求：直接输出合并后的完整 Markdown 文本（以 ## 开头），不要加任何包裹或说明。\n"
+        f"输出完成后，必须在最后单独一行写 {_CONTINUATION_END_MARKER} 作为结束标记。\n"
+        f"\n【A】(P{a.priority}): [{a.tag}] {a.title}\n"
+        f"{a.body}\n"
+        f"\n【B】(P{b.priority}): [{b.tag}] {b.title}\n"
+        f"{b.body}\n"
+    )
 
 
 def apply_dedup_verdicts(
@@ -2885,7 +3206,7 @@ def run_synthesize_stage(
     """Synthesize 阶段：六阶段流水线。
 
     Phase 1: 结构化解析 + 归组（纯代码）
-    Phase 2: 增量相似度扫描（n-gram Jaccard，纯代码）
+    Phase 2: 增量相似度扫描（embedding 余弦相似度 / n-gram Jaccard 降级）
     Phase 3: 疑似重复对送 LLM 判断（仅限同主题内 ≥ threshold）
     Phase 4: 内存中去重/合并
     Phase 5: 拼接写入文件（含 100KB 分卷）
@@ -2912,6 +3233,8 @@ def run_synthesize_stage(
             "similarity": {
                 "threshold": sim_cfg.threshold,
                 "ngram_size": sim_cfg.ngram_size,
+                "method": sim_cfg.method,
+                "embedding_model": sim_cfg.embedding_model,
             },
         }, ensure_ascii=False, sort_keys=True).encode("utf-8")
     ).hexdigest()[:16]
@@ -3011,9 +3334,8 @@ def run_synthesize_stage(
     dump_json(unit_fp_path, unit_fp_data)
 
     # ══════════════════════════════════════════════════════════
-    # Phase 2: 增量相似度扫描（n-gram Jaccard，纯代码）
+    # Phase 2: 增量相似度扫描
     # ══════════════════════════════════════════════════════════
-    print(f"[synthesize] Phase 2: 增量相似度扫描 (阈值={sim_cfg.threshold:.0%}, n={sim_cfg.ngram_size})...")
     all_fps = {u.fingerprint for u in all_units}
     new_fps = all_fps - cached_unit_fps
     print(f"[synthesize] 全量 {len(all_fps)} 条, 新增 {len(new_fps)} 条, 缓存 {len(cached_unit_fps)} 条")
@@ -3022,7 +3344,39 @@ def run_synthesize_stage(
         print("[synthesize] 无新增单元，跳过相似度扫描")
         intra_pairs: List[tuple[KnowledgeUnit, KnowledgeUnit, float]] = []
         cross_pairs: List[tuple[KnowledgeUnit, KnowledgeUnit, float]] = []
+    elif sim_cfg.method == "embedding":
+        emb_src = sim_cfg.embedding_api_url if sim_cfg.embedding_api_url else "synthesize 端点"
+        print(f"[synthesize] Phase 2: Embedding 语义相似度扫描 (阈值={sim_cfg.threshold:.0%}, model={sim_cfg.embedding_model}, 端点={emb_src})...")
+
+        # 1. 加载 embedding 缓存
+        emb_cache_path = intermediate_dir / "embedding_cache.json"
+        emb_cache = _load_embedding_cache(emb_cache_path) if not full_resync else {}
+        cached_emb_count = len(emb_cache)
+
+        # 2. 找出未缓存的单元，批量调用 embedding API
+        uncached_units = [u for u in all_units if u.fingerprint not in emb_cache]
+        if uncached_units:
+            print(f"[embedding] 需要获取 {len(uncached_units)} 条 embedding (已缓存 {cached_emb_count} 条)...")
+            texts = [u.body for u in uncached_units]
+            vectors = _get_embeddings(
+                texts, config, endpoint_states, sim_cfg,
+            )
+            for u, vec in zip(uncached_units, vectors):
+                emb_cache[u.fingerprint] = vec
+            print(f"[embedding] 获取完成, 总缓存 {len(emb_cache)} 条")
+
+            # 3. 保存缓存
+            _save_embedding_cache(emb_cache_path, emb_cache)
+        else:
+            print(f"[embedding] 全部 {cached_emb_count} 条 embedding 已缓存")
+
+        # 4. 调用 embedding 相似度扫描
+        intra_pairs, cross_pairs = scan_similarity_embedding(
+            topic_units, all_units, cached_unit_fps,
+            sim_cfg.threshold, emb_cache,
+        )
     else:
+        print(f"[synthesize] Phase 2: 增量相似度扫描 n-gram (阈值={sim_cfg.threshold:.0%}, n={sim_cfg.ngram_size})...")
         intra_pairs, cross_pairs = scan_similarity(
             topic_units, all_units, cached_unit_fps,
             sim_cfg.threshold, sim_cfg.ngram_size,
@@ -3030,9 +3384,9 @@ def run_synthesize_stage(
     print(f"[synthesize] 同主题相似对: {len(intra_pairs)}, 跨主题相似对: {len(cross_pairs)}")
 
     # ══════════════════════════════════════════════════════════
-    # Phase 3: 疑似重复对送 LLM 判断（仅同主题内）
+    # Phase 3a: 批量 verdict 判断（仅同主题内）
     # ══════════════════════════════════════════════════════════
-    print(f"[synthesize] Phase 3: LLM 重复判断...")
+    print(f"[synthesize] Phase 3a: LLM verdict 判断...")
 
     # 过滤已有缓存的判断
     new_pairs: List[tuple[KnowledgeUnit, KnowledgeUnit, float]] = []
@@ -3043,7 +3397,7 @@ def run_synthesize_stage(
 
     print(f"[synthesize] 需要 LLM 判断: {len(new_pairs)} 对 (已缓存: {len(intra_pairs) - len(new_pairs)} 对)")
 
-    # 批量送 LLM
+    # 批量送 LLM 获取 verdict
     if new_pairs:
         batch_size = sim_cfg.llm_batch_size
         system_prompt = config.synthesize_stage.system_prompt
@@ -3051,7 +3405,9 @@ def run_synthesize_stage(
 
         for batch_start in range(0, len(new_pairs), batch_size):
             batch = new_pairs[batch_start:batch_start + batch_size]
-            print(f"[synthesize] LLM 判断批次 {batch_start // batch_size + 1}: {len(batch)} 对")
+            batch_num = batch_start // batch_size + 1
+            total_batches = (len(new_pairs) + batch_size - 1) // batch_size
+            print(f"[synthesize] verdict 批次 {batch_num}/{total_batches}: {len(batch)} 对")
 
             prompt = build_dedup_prompt(batch)
             try:
@@ -3062,44 +3418,38 @@ def run_synthesize_stage(
                     user_prompt=prompt,
                     runtime=config.runtime,
                 )
-                results = _repair_json(raw)
-                if not isinstance(results, list):
-                    results = [results]
-
+                verdicts = _parse_verdicts(raw, len(batch))
                 consecutive_all_fail = 0
 
-                for item in results:
-                    pair_idx = item.get("pair", 0) - 1
-                    if 0 <= pair_idx < len(batch):
-                        a, b, sim = batch[pair_idx]
-                        pair_key = "_".join(sorted([a.fingerprint, b.fingerprint]))
-                        verdict = item.get("verdict", "KEEP_BOTH")
-                        judgment: dict = {"verdict": verdict}
+                for pair_idx, entry in enumerate(verdicts):
+                    a, b, sim = batch[pair_idx]
+                    pair_key = "_".join(sorted([a.fingerprint, b.fingerprint]))
+                    verdict = entry.get("verdict", "KEEP_BOTH")
+                    judgment: dict = {"verdict": verdict}
 
-                        if verdict == "DUPLICATE":
-                            keep_side = item.get("keep", "A")
-                            if keep_side == "B":
-                                judgment["keep"] = b.fingerprint
-                                judgment["drop"] = a.fingerprint
-                            else:
-                                judgment["keep"] = a.fingerprint
-                                judgment["drop"] = b.fingerprint
-                        elif verdict == "MERGE":
-                            judgment["merged_text"] = item.get("merged_text", "")
+                    if verdict == "DUPLICATE":
+                        keep_side = entry.get("keep", "A")
+                        if keep_side == "B":
+                            judgment["keep"] = b.fingerprint
+                            judgment["drop"] = a.fingerprint
+                        else:
+                            judgment["keep"] = a.fingerprint
+                            judgment["drop"] = b.fingerprint
+                    # MERGE: 此时仅记录 verdict，merged_text 留到 Phase 3b
 
-                        cached_judgments[pair_key] = judgment
+                    cached_judgments[pair_key] = judgment
 
             except EndpointsExhaustedError:
-                print("[synthesize] 所有端点熔断，停止 LLM 判断")
+                print("[synthesize] 所有端点熔断，停止 verdict 判断")
                 break
             except PipelineError as exc:
                 consecutive_all_fail += 1
-                print(f"[synthesize] LLM 判断失败: {exc}")
+                print(f"[synthesize] verdict 判断失败: {exc}")
                 if consecutive_all_fail >= 3:
-                    print("[synthesize] 连续 3 次失败，停止 LLM 判断")
+                    print("[synthesize] 连续 3 次失败，停止 verdict 判断")
                     break
 
-    # 保存判断缓存
+    # 中间保存一次缓存（verdict 结果）
     dump_json(dedup_cache_path, {
         "merge_sig": merge_sig,
         "judgments": cached_judgments,
@@ -3108,7 +3458,61 @@ def run_synthesize_stage(
     dup_count = sum(1 for j in cached_judgments.values() if j.get("verdict") == "DUPLICATE")
     merge_count = sum(1 for j in cached_judgments.values() if j.get("verdict") == "MERGE")
     keep_count = sum(1 for j in cached_judgments.values() if j.get("verdict") == "KEEP_BOTH")
-    print(f"[synthesize] 判断结果: DUPLICATE={dup_count}, MERGE={merge_count}, KEEP_BOTH={keep_count}")
+    print(f"[synthesize] verdict 结果: DUPLICATE={dup_count}, MERGE={merge_count}, KEEP_BOTH={keep_count}")
+
+    # ══════════════════════════════════════════════════════════
+    # Phase 3b: 逐对合并（仅处理 MERGE 且缺少 merged_text 的对）
+    # ══════════════════════════════════════════════════════════
+    merge_needed: List[Tuple[str, KnowledgeUnit, KnowledgeUnit, float]] = []
+    for a, b, sim in intra_pairs:
+        pair_key = "_".join(sorted([a.fingerprint, b.fingerprint]))
+        j = cached_judgments.get(pair_key)
+        if j and j.get("verdict") == "MERGE" and not j.get("merged_text"):
+            merge_needed.append((pair_key, a, b, sim))
+
+    if merge_needed:
+        print(f"[synthesize] Phase 3b: 逐对合并 {len(merge_needed)} 对...")
+        system_prompt = config.synthesize_stage.system_prompt
+        consecutive_merge_fail = 0
+
+        for mi, (pair_key, a, b, sim) in enumerate(merge_needed, 1):
+            print(f"[synthesize] 合并 {mi}/{len(merge_needed)}: [{a.tag}] {a.title} ↔ {b.title}")
+            prompt = build_merge_prompt(a, b, sim)
+            try:
+                merged_text = call_llm_with_continuation(
+                    stage=config.synthesize_stage,
+                    endpoint_states=endpoint_states,
+                    system_prompt=system_prompt,
+                    user_prompt=prompt,
+                    runtime=config.runtime,
+                )
+                merged_text = strip_code_fences(merged_text).strip()
+                if merged_text:
+                    cached_judgments[pair_key]["merged_text"] = merged_text
+                    consecutive_merge_fail = 0
+                else:
+                    print(f"[synthesize] 合并返回空文本，跳过")
+            except EndpointsExhaustedError:
+                print("[synthesize] 所有端点熔断，停止合并")
+                break
+            except PipelineError as exc:
+                consecutive_merge_fail += 1
+                print(f"[synthesize] 合并失败: {exc}")
+                if consecutive_merge_fail >= 3:
+                    print("[synthesize] 连续 3 次合并失败，停止")
+                    break
+
+    # 保存最终判断缓存
+    dump_json(dedup_cache_path, {
+        "merge_sig": merge_sig,
+        "judgments": cached_judgments,
+    })
+
+    dup_count = sum(1 for j in cached_judgments.values() if j.get("verdict") == "DUPLICATE")
+    merge_count = sum(1 for j in cached_judgments.values() if j.get("verdict") == "MERGE" and j.get("merged_text"))
+    merge_pending = sum(1 for j in cached_judgments.values() if j.get("verdict") == "MERGE" and not j.get("merged_text"))
+    keep_count = sum(1 for j in cached_judgments.values() if j.get("verdict") == "KEEP_BOTH")
+    print(f"[synthesize] 最终判断: DUPLICATE={dup_count}, MERGE={merge_count} (未合并={merge_pending}), KEEP_BOTH={keep_count}")
 
     # ══════════════════════════════════════════════════════════
     # Phase 4: 内存中去重/合并
