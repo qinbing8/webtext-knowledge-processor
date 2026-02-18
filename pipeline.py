@@ -1407,9 +1407,10 @@ def call_llm_with_failover(
         except PipelineError as exc:
             es.record_failure(error_msg=str(exc))
             failures.append(f"{es.name}: {exc}")
+            print(f"[failover] 端点 '{es.name}' 失败：{exc}")
             next_i = i + 1
             if next_i < len(available):
-                print(f"[failover] 端点 '{es.name}' 失败，切换到 '{available[next_i].name}'")
+                print(f"[failover] 切换到 '{available[next_i].name}'")
 
     raise PipelineError("所有端点均调用失败：" + " | ".join(failures))
 
@@ -2282,8 +2283,12 @@ def run_extract_stage(
 
     # ── 执行（串行 or 并发） ──
     max_workers = config.concurrency.max_workers
+    # 工作单元数少于 max_workers 时强制串行，避免少量任务下线程争用端点锁
+    use_serial = max_workers <= 1 or len(work_units) < max_workers
 
-    if max_workers <= 1:
+    if use_serial:
+        if max_workers > 1 and len(work_units) < max_workers:
+            print(f"[extract] 工作单元({len(work_units)})少于并发数({max_workers})，使用串行模式")
         for unit in work_units:
             _process_extract_unit(unit)
             if stop_event.is_set():
@@ -2310,7 +2315,7 @@ def run_extract_stage(
                 raise
 
     # ── 并发日志输出 ──
-    if max_workers > 1:
+    if not use_serial:
         clog.write_log(log_dir)
         clog.print_summary()
 
