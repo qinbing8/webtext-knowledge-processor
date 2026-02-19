@@ -3042,12 +3042,13 @@ def write_topic_files(
     topics_dir: Path,
     max_kb: int,
     topic_fp_cache: dict,
-) -> List[str]:
+) -> tuple[list[str], dict[str, str]]:
     """按优先级排序 + 100KB 分卷写入主题文件。
 
-    返回写入的文件名列表。
+    返回 (写入的文件名列表, unit fingerprint→filename 映射)。
     """
     written_files: List[str] = []
+    unit_file_map: Dict[str, str] = {}  # fingerprint → filename
 
     for topic_name, units in sorted(topic_units.items(), key=lambda kv: (kv[0] == "未分类", kv[0])):
         if not units:
@@ -3086,12 +3087,15 @@ def write_topic_files(
             file_path = topics_dir / base_name
             _atomic_write(file_path, full_text)
             written_files.append(base_name)
+            for u in units:
+                unit_file_map[u.fingerprint] = base_name
             topic_fp_cache[topic_name] = {"fingerprint": content_fp, "files": [base_name]}
             print(f"[synthesize] → {base_name} ({full_bytes / 1024:.1f}KB)")
         else:
             # 分卷：按知识单元边界切分
             volume_files: List[str] = []
             current_parts: List[str] = []
+            current_units: List[KnowledgeUnit] = []
             current_size = 0
             vol_num = 1
 
@@ -3103,12 +3107,16 @@ def write_topic_files(
                     vol_path = topics_dir / vol_name
                     _atomic_write(vol_path, "\n\n".join(current_parts))
                     volume_files.append(vol_name)
+                    for cu in current_units:
+                        unit_file_map[cu.fingerprint] = vol_name
                     print(f"[synthesize] → {vol_name} ({current_size / 1024:.1f}KB)")
                     current_parts = []
+                    current_units = []
                     current_size = 0
                     vol_num += 1
 
                 current_parts.append(u.body)
+                current_units.append(u)
                 current_size += u_bytes + 2
 
             if current_parts:
@@ -3116,12 +3124,14 @@ def write_topic_files(
                 vol_path = topics_dir / vol_name
                 _atomic_write(vol_path, "\n\n".join(current_parts))
                 volume_files.append(vol_name)
+                for cu in current_units:
+                    unit_file_map[cu.fingerprint] = vol_name
                 print(f"[synthesize] → {vol_name} ({current_size / 1024:.1f}KB)")
 
             written_files.extend(volume_files)
             topic_fp_cache[topic_name] = {"fingerprint": content_fp, "files": volume_files}
 
-    return written_files
+    return written_files, unit_file_map
 
 
 def generate_index(
@@ -3201,6 +3211,52 @@ def generate_cross_topic_report(
     report_path = intermediate_dir / "cross_topic_similarity.txt"
     report_path.write_text("\n".join(lines), encoding="utf-8")
     print(f"[synthesize] → 跨主题相似度报告: {len(sorted_pairs[:50])} 对")
+
+
+def generate_changelog(
+    new_fps: set,
+    all_units: List[KnowledgeUnit],
+    unit_file_map: Dict[str, str],
+    unit_topic_map: Dict[str, str],
+    intermediate_dir: Path,
+) -> None:
+    """生成本次 synthesize 新增知识单元的变更报告。"""
+    if not new_fps:
+        print("[synthesize] 无新增知识单元，跳过变更报告")
+        return
+
+    # 筛选新增单元，且仅保留本次写入了文件的（排除缓存跳过的主题）
+    new_units = [u for u in all_units if u.fingerprint in new_fps and u.fingerprint in unit_file_map]
+    if not new_units:
+        print("[synthesize] 新增单元均属于缓存跳过的主题，跳过变更报告")
+        return
+
+    # 按主题分组
+    by_topic: Dict[str, List[KnowledgeUnit]] = {}
+    for u in new_units:
+        topic = unit_topic_map.get(u.fingerprint, "未分类")
+        by_topic.setdefault(topic, []).append(u)
+
+    timestamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+    ts_display = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    lines = [
+        "# Synthesize 变更报告\n",
+        f"> 生成时间: {ts_display}",
+        f"> 新增知识单元: {len(new_units)} 条\n",
+    ]
+
+    for topic_name in sorted(by_topic.keys()):
+        topic_units = by_topic[topic_name]
+        lines.append(f"## {topic_name} (+{len(topic_units)})\n")
+        for u in topic_units:
+            fname = unit_file_map[u.fingerprint]
+            lines.append(f"- [{fname}](./topics/{fname}) — [{u.tag}][P{u.priority}] {u.title}")
+        lines.append("")
+
+    changelog_path = intermediate_dir / f"changelog_{timestamp}.md"
+    changelog_path.write_text("\n".join(lines), encoding="utf-8")
+    print(f"[synthesize] → 变更报告: {len(new_units)} 条新增知识单元 ({changelog_path.name})")
 
 
 def run_synthesize_stage(
@@ -3550,7 +3606,7 @@ def run_synthesize_stage(
             old_file.unlink()
             print(f"[synthesize] 清理旧文件: {old_file.name}")
 
-    topic_files = write_topic_files(
+    topic_files, unit_file_map = write_topic_files(
         deduped_units, topics_dir, sim_cfg.max_file_size_kb, topic_fp_cache,
     )
 
@@ -3563,6 +3619,16 @@ def run_synthesize_stage(
     print("[synthesize] Phase 6: 生成目录与报告...")
     generate_index(topics_dir, deduped_units, unmapped_tags, tag_buckets, mapping)
     generate_cross_topic_report(cross_pairs, unit_topic_map, intermediate_dir)
+
+    # ── 变更报告（首次运行不生成） ──
+    if cached_unit_fps:
+        generate_changelog(
+            new_fps=new_fps,
+            all_units=all_units,
+            unit_file_map=unit_file_map,
+            unit_topic_map=unit_topic_map,
+            intermediate_dir=intermediate_dir,
+        )
 
     # ── 写入缓存 manifest ──
     topic_files.sort()
