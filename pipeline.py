@@ -3042,7 +3042,7 @@ def write_topic_files(
     topics_dir: Path,
     max_kb: int,
     topic_fp_cache: dict,
-) -> tuple[list[str], dict[str, str]]:
+) -> Tuple[List[str], Dict[str, str]]:
     """按优先级排序 + 100KB 分卷写入主题文件。
 
     返回 (写入的文件名列表, unit fingerprint→filename 映射)。
@@ -3237,8 +3237,9 @@ def generate_changelog(
         topic = unit_topic_map.get(u.fingerprint, "未分类")
         by_topic.setdefault(topic, []).append(u)
 
-    timestamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
-    ts_display = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    now = dt.datetime.now()
+    timestamp = now.strftime("%Y%m%d_%H%M%S")
+    ts_display = now.strftime("%Y-%m-%d %H:%M:%S")
 
     lines = [
         "# Synthesize 变更报告\n",
@@ -3251,7 +3252,7 @@ def generate_changelog(
         lines.append(f"## {topic_name} (+{len(topic_units)})\n")
         for u in topic_units:
             fname = unit_file_map[u.fingerprint]
-            lines.append(f"- [{fname}](./topics/{fname}) — [{u.tag}][P{u.priority}] {u.title}")
+            lines.append(f"- [{fname}](../topics/{fname}) — [{u.tag}][P{u.priority}] {u.title}")
         lines.append("")
 
     changelog_path = intermediate_dir / f"changelog_{timestamp}.md"
