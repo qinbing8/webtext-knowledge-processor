@@ -143,31 +143,62 @@ python "pipeline.py" --config "config.smoke.yaml" --only-stage all
 
 ## 5. Synthesize 阶段工作原理
 
-synthesize 阶段采用**先归组、后合并**的策略，将 extract 产出的细粒度知识单元归组为分类级文档：
+synthesize 阶段采用**六阶段流水线**，将 extract 产出的细粒度知识单元归组、去重、合并为分类级文档：
 
-### Phase 1：按分类标签归组（纯代码，零 LLM 调用）
+### Phase 1：结构化解析 + 归组（纯代码，零 LLM 调用）
 
 - 读取 `_intermediate/extract/` 下所有 `.md` 文件
 - 按 `## [分类标签][Px]` 格式的二级标题识别知识单元
-- 相同分类标签的知识单元归入同一组
-- 未匹配标签格式的单元归入"未分类"
-- 输出：`{ 分类名: [知识单元文本, ...] }` 映射表
+- 通过 `config.yaml` 中的 `mapping` 规则将标签映射到主题
+- 构建 unit 指纹缓存，识别新增/已缓存单元
+- 输出：`{ 主题名: [KnowledgeUnit, ...] }` 映射表
 
-### Phase 2：逐分类 LLM 合并去重
+### Phase 2：增量相似度扫描
 
-- 遍历 Phase 1 的分类列表
-- 每个分类只发送该分类下的所有知识单元
-- 使用 `stages.synthesize.system_prompt` 作为系统提示词
-- LLM 负责去重合并，保留所有独特内容
-- 若分类下仅 1 条知识单元，直接写入无需调用 LLM
-- 若分类内容超过批次大小限制，自动分批调用后拼接
-- 进度显示：`[synthesize 2/6] 角色塑造 (15 条, 42.3KB)`
+- 支持两种模式：**embedding 余弦相似度**（默认）或 **n-gram Jaccard** 降级
+- 仅对新增单元与全量单元进行比较，已缓存的对跳过
+- 产出同主题内相似对（`intra_pairs`）和跨主题相似对（`cross_pairs`）
 
-### Phase 3：写入与缓存
+### Phase 3：LLM 判断 + 合并（两阶段）
 
-- 每个分类写入一个 `.md` 文件到 `topics/` 目录
-- 文件名格式：`01_分类名.md`
-- 写入缓存指纹和 manifest，重跑时如 extract 结果未变则自动跳过
+- **Phase 3a（verdict）**：将相似度 ≥ 阈值的同主题对批量发送 LLM，判断 DUPLICATE / MERGE / KEEP_BOTH
+- **Phase 3b（merge）**：对判定为 MERGE 的对逐对调用 LLM 生成合并文本
+- 判断结果持久化缓存，重跑时自动复用
+
+### Phase 4：内存中去重/合并
+
+- 根据 Phase 3 的判断结果，在内存中执行去重和合并操作
+- 输出去重后的 `deduped_units`
+
+### Phase 5：拼接写入文件（含分卷）
+
+- 按主题写入 `topics/` 目录下的 `.md` 文件
+- 单文件超过分卷阈值（默认 100KB）时自动按知识单元边界切分为多卷
+- 内容未变的主题自动跳过写入（指纹缓存命中）
+
+### Phase 6：生成目录与报告
+
+- 生成 `00-目录与导读.md`（主题总览表）
+- 生成 `cross_topic_similarity.txt`（跨主题相似度报告）
+- 生成 `changelog_{timestamp}.md`（增量变更报告，首次运行不生成）
+
+### 增量变更报告
+
+每次增量运行后，在 `_intermediate/` 目录自动生成一份变更报告，列出本次新增的知识单元及其所在文件，按主题分组排序。首次运行（无旧缓存）不生成报告。
+
+报告示例：
+
+```markdown
+# Synthesize 变更报告
+
+> 生成时间: 2026-02-19 14:30:00
+> 新增知识单元: 47 条
+
+## 08-创作心态篇 (+12)
+
+- [08-创作心态篇.md](../topics/08-创作心态篇.md) — [写作心态][P2] 自我审视能力的前提是审美
+- ...
+```
 
 ---
 
@@ -183,10 +214,16 @@ output_dir/
 │   │   └── 文件2.txt.md
 │   ├── synthesize_fingerprint.txt        # synthesize 缓存指纹
 │   ├── synthesize_manifest.json          # synthesize 缓存清单
+│   ├── unit_fingerprints.json            # 知识单元指纹缓存
+│   ├── topic_fingerprints.json           # 主题内容指纹缓存
+│   ├── embedding_cache.json              # embedding 向量缓存
+│   ├── cross_topic_similarity.txt        # 跨主题相似度报告
+│   ├── changelog_20260219_143000.md      # 增量变更报告（每次运行生成）
 │   └── run_summary.json                  # 运行摘要
-├── topics/                               # 阶段2：分类级 Markdown 文档
-│   ├── 01_角色塑造与代入感.md
-│   ├── 02_剧情结构与节奏.md
+├── topics/                               # 阶段2：主题级 Markdown 文档
+│   ├── 00-目录与导读.md
+│   ├── 01-认知与定位篇.md
+│   ├── 02-选题与开篇篇.md
 │   └── ...
 └── _logs/                                # 仅出错时生成
     └── pipeline_error_*.log
